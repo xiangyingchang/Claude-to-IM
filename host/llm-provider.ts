@@ -77,10 +77,8 @@ export class ClaudeLLMProvider implements LLMProvider {
           pathToClaudeCodeExecutable: claudePath,
           permissionMode: mapPermissionMode(params.permissionMode),
           canUseTool: makeCanUseTool(provider, params, controller, abortController.signal),
-          // Set working directory so Claude reads the correct CLAUDE.md
           cwd: process.cwd(),
-          // Required to load project-level CLAUDE.md (disabled by default in SDK mode)
-          settingSources: ['project', 'user'] as any,
+          settingSources: ['project', 'user'],
         };
 
         const session = params.sdkSessionId
