@@ -36,6 +36,7 @@ import {
   buildStreamingContent,
   buildFinalCardJson,
   buildPermissionButtonCard,
+  buildButtonCard,
   formatElapsed,
 } from '../markdown/feishu.js';
 
@@ -642,9 +643,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
       text = preprocessFeishuMarkdown(text);
     }
 
-    // If there are inline buttons (permission prompts), send card with action buttons
+    // If there are inline buttons, send card with action buttons.
+    // Route to the appropriate card builder based on button prefix.
     if (message.inlineButtons && message.inlineButtons.length > 0) {
-      return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
+      const firstBtn = message.inlineButtons.flat()[0];
+      if (firstBtn?.callbackData?.startsWith('perm:')) {
+        return this.sendPermissionCard(message.address.chatId, text, message.inlineButtons);
+      }
+      return this.sendButtonCard(message.address.chatId, text, message.inlineButtons);
     }
 
     // Rendering strategy (aligned with Openclaw):
@@ -746,17 +752,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     // Convert HTML text from permission-broker to Feishu markdown.
-    // permission-broker sends HTML (<b>, <code>, <pre>, &amp; entities)
-    // but Feishu card markdown elements don't understand HTML.
-    const mdText = text
-      .replace(/<b>(.*?)<\/b>/gi, '**$1**')
-      .replace(/<code>(.*?)<\/code>/gi, '`$1`')
-      .replace(/<pre>([\s\S]*?)<\/pre>/gi, '```\n$1\n```')
-      .replace(/<[^>]+>/g, '')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&amp;/g, '&')
-      .replace(/&quot;/g, '"');
+    const mdText = this.htmlToCardMarkdown(text);
 
     // Extract permissionRequestId from the first button's callback data
     const firstBtn = inlineButtons.flat()[0];
@@ -858,6 +854,85 @@ export class FeishuAdapter extends BaseChannelAdapter {
           receive_id: chatId,
           msg_type: 'text',
           content: JSON.stringify({ text: plainText }),
+        },
+      });
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
+      }
+      return { ok: false, error: res?.msg || 'Send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
+  }
+
+  /**
+   * Send a generic interactive card with action buttons (e.g. model selection).
+   * Converts inlineButton labels/callbackData pairs into Feishu card action buttons.
+   */
+  /** Convert HTML text to Feishu card markdown. Shared by both card builders. */
+  private htmlToCardMarkdown(html: string): string {
+    return html
+      .replace(/<b>(.*?)<\/b>/gi, '**$1**')
+      .replace(/<code>(.*?)<\/code>/gi, '`$1`')
+      .replace(/<pre>([\s\S]*?)<\/pre>/gi, '```\n$1\n```')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&quot;/g, '"');
+  }
+
+  private async sendButtonCard(
+    chatId: string,
+    text: string,
+    inlineButtons: import('../types.js').InlineButton[][],
+  ): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+
+    // Convert HTML text to Feishu markdown
+    const mdText = this.htmlToCardMarkdown(text);
+
+    // Map inline buttons to card button rows
+    const buttonRows = inlineButtons.map((row) =>
+      row.map((btn) => ({ label: btn.text, callbackData: btn.callbackData })),
+    );
+
+    const cardJson = buildButtonCard('Select', mdText, buttonRows);
+
+    try {
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardJson,
+        },
+      });
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
+      }
+      console.warn('[feishu-adapter] Button card send failed:', JSON.stringify({ code: (res as any)?.code, msg: res?.msg }));
+    } catch (err) {
+      console.warn('[feishu-adapter] Button card error:', err instanceof Error ? err.message : err);
+    }
+
+    // Fallback: plain text with model names
+    const fallbackText = [
+      mdText,
+      '',
+      '---',
+      ...inlineButtons.flat().map((btn) => `\`${btn.text}\``),
+    ].join('\n');
+
+    try {
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'text',
+          content: JSON.stringify({ text: fallbackText }),
         },
       });
       if (res?.data?.message_id) {

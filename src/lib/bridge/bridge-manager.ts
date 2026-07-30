@@ -60,6 +60,14 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
 }
 
 /**
+ * Format a model ID into a user-friendly button label.
+ * If this model is currently selected, prefix with a checkmark.
+ */
+function formatModelLabel(modelId: string, currentModel: string): string {
+  return modelId === currentModel ? `✅ ${modelId}` : modelId;
+}
+
+/**
  * Check if a message looks like a numeric permission shortcut (1/2/3) for
  * feishu/qq channels WITH at least one pending permission in that chat.
  *
@@ -455,8 +463,31 @@ async function handleMessage(
     }
   };
 
-  // Handle callback queries (permission buttons)
+  // Handle callback queries (permission buttons, model selection)
   if (msg.callbackData) {
+    // ── Model selection callback ──
+    if (msg.callbackData.startsWith('model:')) {
+      const modelId = msg.callbackData.slice('model:'.length);
+      const binding = router.resolve(msg.address);
+      router.updateBinding(binding.id, { model: modelId });
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[CONFIG] Model changed to: ${modelId}`,
+      });
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Model set to <b>${escapeHtml(modelId)}</b>`,
+        parseMode: 'HTML',
+        replyToMessageId: msg.callbackMessageId,
+      });
+      ack();
+      return;
+    }
+
+    // ── Permission callback ──
     const handled = broker.handlePermissionCallback(msg.callbackData, msg.address.chatId, msg.callbackMessageId);
     if (handled) {
       // Send confirmation
@@ -822,6 +853,8 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/runtime claude|codex|auto - Switch LLM runtime (needs restart)',
+        '/models - List available models',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
@@ -901,9 +934,11 @@ async function handleCommand(
 
     case '/status': {
       const binding = router.resolve(msg.address);
+      const runtime = store.getSetting('bridge_runtime') || 'claude';
       response = [
         '<b>Bridge Status</b>',
         '',
+        `Runtime: <b>${runtime}</b>`,
         `Session: <code>${binding.codepilotSessionId.slice(0, 8)}...</code>`,
         `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
         `Mode: <b>${binding.mode}</b>`,
@@ -961,6 +996,79 @@ async function handleCommand(
       break;
     }
 
+    case '/runtime': {
+      const validRuntimes = ['claude', 'codex', 'auto'];
+      const newRuntime = args.trim().toLowerCase();
+      if (!validRuntimes.includes(newRuntime)) {
+        const current = store.getSetting('bridge_runtime') || 'claude';
+        response = `Usage: /runtime claude|codex|auto\nCurrent runtime: <b>${current}</b>`;
+        break;
+      }
+      const { lifecycle } = getBridgeContext();
+      if (!lifecycle.onRuntimeChange) {
+        response = 'Runtime switching is not supported in this environment.';
+        break;
+      }
+      const applied = await lifecycle.onRuntimeChange(newRuntime);
+      if (applied) {
+        store.insertAuditLog({
+          channelType: adapter.channelType,
+          chatId: msg.address.chatId,
+          direction: 'inbound',
+          messageId: msg.messageId,
+          summary: `[CONFIG] Runtime changed to: ${applied}`,
+        });
+        response = [
+          `Runtime changed to <b>${applied}</b>.`,
+          '',
+          '⚠️ <b>Restart required.</b> The bridge must be restarted for this to take effect.',
+          'Restart it from your terminal: <code>/claude-to-im stop &amp;&amp; /claude-to-im start</code>',
+        ].join('\n');
+      } else {
+        response = 'Failed to update runtime. Check the bridge logs for details.';
+      }
+      break;
+    }
+
+    case '/models': {
+      const { lifecycle } = getBridgeContext();
+      if (!lifecycle.onGetModels) {
+        response = 'Model listing is not supported in this environment.';
+        break;
+      }
+      const models = await lifecycle.onGetModels();
+      if (models.length === 0) {
+        response = 'No models available.';
+        break;
+      }
+      // Build inline keyboard: 2 buttons per row
+      const binding = router.resolve(msg.address);
+      const currentModel = binding.model || 'default';
+      const rows: Array<Array<{ text: string; callbackData: string }>> = [];
+      for (let i = 0; i < models.length; i += 2) {
+        const row: Array<{ text: string; callbackData: string }> = [];
+        row.push({
+          text: formatModelLabel(models[i], currentModel),
+          callbackData: `model:${models[i]}`,
+        });
+        if (i + 1 < models.length) {
+          row.push({
+            text: formatModelLabel(models[i + 1], currentModel),
+            callbackData: `model:${models[i + 1]}`,
+          });
+        }
+        rows.push(row);
+      }
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Current model: <b>${escapeHtml(currentModel)}</b>\nSelect a model:`,
+        parseMode: 'HTML',
+        inlineButtons: rows,
+        replyToMessageId: msg.messageId,
+      });
+      break;
+    }
+
     case '/help':
       response = [
         '<b>CodePilot Bridge Commands</b>',
@@ -969,6 +1077,8 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/runtime claude|codex|auto - Switch LLM runtime (needs restart)',
+        '/models - List available models',
         '/status - Show current status',
         '/sessions - List recent sessions',
         '/stop - Stop current session',

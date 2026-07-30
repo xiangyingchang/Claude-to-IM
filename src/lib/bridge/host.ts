@@ -249,4 +249,15 @@ export interface LifecycleHooks {
   onBridgeStart?(): void;
   /** Called when the bridge system stops. */
   onBridgeStop?(): void;
+  /**
+   * Called when the user requests a runtime change via /runtime command.
+   * Returns the new runtime value that was actually applied.
+   * The bridge must be restarted for the change to take effect.
+   */
+  onRuntimeChange?(newRuntime: string): Promise<string | null>;
+  /**
+   * Called when the user requests available models via /models command.
+   * Returns an ordered list of model identifiers.
+   */
+  onGetModels?(): Promise<string[]>;
 }

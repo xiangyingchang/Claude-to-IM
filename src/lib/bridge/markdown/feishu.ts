@@ -235,3 +235,51 @@ export function buildPermissionButtonCard(
     },
   });
 }
+
+/**
+ * Build a generic interactive card with arbitrary action buttons.
+ * Used for model selection and other non-permission interactive prompts.
+ *
+ * @param title     Card header title
+ * @param bodyText  Card body text (Feishu markdown)
+ * @param buttons   Array of button rows, each button: { label, callbackData }
+ */
+export function buildButtonCard(
+  title: string,
+  bodyText: string,
+  buttons: Array<Array<{ label: string; callbackData: string }>>,
+): string {
+  const columnSets = buttons.map((row) => ({
+    tag: 'column_set' as const,
+    flex_mode: 'none',
+    horizontal_align: 'left' as const,
+    columns: row.map((btn) => ({
+      tag: 'column' as const,
+      width: 'auto' as const,
+      elements: [{
+        tag: 'button' as const,
+        text: { tag: 'plain_text' as const, content: btn.label },
+        type: 'default' as const,
+        size: 'medium' as const,
+        value: { callback_data: btn.callbackData },
+      }],
+    })),
+  }));
+
+  return JSON.stringify({
+    schema: '2.0',
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: title },
+      template: 'blue',
+      padding: '12px 12px 12px 12px',
+    },
+    body: {
+      elements: [
+        { tag: 'markdown', content: bodyText, text_size: 'normal' },
+        { tag: 'hr' },
+        ...columnSets,
+      ],
+    },
+  });
+}
