@@ -491,7 +491,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
   ): Promise<boolean> {
-    return this.streamCoordinator.end(chatId, status, responseText);
+    const delivered = await this.streamCoordinator.end(chatId, status, responseText);
+    console.log(`[feishu-adapter] Stream finalized: chatId=${chatId}, delivered=${delivered}, status=${status}`);
+    return delivered;
   }
 
   // ── Send ────────────────────────────────────────────────────

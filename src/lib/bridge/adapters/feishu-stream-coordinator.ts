@@ -491,6 +491,20 @@ export class FeishuStreamCoordinator {
       if (delivered) return true;
     }
 
+    // Once tool progress exists, the current content message physically sits
+    // before that progress bubble. Send the final plain answer after progress
+    // and remove fragmented previews so the final answer is always last.
+    if (state.progressMessageIds.length > 0 || state.contentMessageIds.length > 1) {
+      const delivered = await this.sendFinalReplacement(
+        state,
+        () => this.transport.createPost(chatId, this.renderer.post(
+          `${responseText || currentText || '💭 Thinking...'}\n\n${finalStatus} · ${elapsed}`,
+        )),
+        'stream.final.ordered',
+      );
+      if (delivered) return true;
+    }
+
     if (state.currentMessageId && !state.segmentClosed) {
       try {
         if (state.contentEditCount >= this.maxEditsPerMessage) {

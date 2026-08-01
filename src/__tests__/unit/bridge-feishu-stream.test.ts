@@ -164,7 +164,7 @@ describe('FeishuStreamCoordinator', () => {
     assert.equal(operations.filter((operation) => operation.type === 'update').length, 0);
   });
 
-  it('finalizes a segmented simple answer using only the current segment', async () => {
+  it('puts the final answer after tool progress and removes fragmented previews', async () => {
     const { coordinator, operations } = createHarness();
 
     coordinator.start('chat-1');
@@ -174,11 +174,14 @@ describe('FeishuStreamCoordinator', () => {
     const delivered = await coordinator.end('chat-1', 'completed', 'AB');
 
     assert.equal(delivered, true);
-    const finalUpdate = operations
-      .filter((operation) => operation.type === 'update')
+    const finalCreate = operations
+      .filter((operation) => operation.type === 'create')
       .at(-1);
-    assert.equal(finalUpdate?.content?.includes('post:B'), true);
-    assert.equal(finalUpdate?.content?.includes('post:AB'), false);
+    assert.equal(finalCreate?.content?.includes('post:AB'), true);
+    const progressIndex = operations.findIndex((operation) => operation.content?.startsWith('progress:'));
+    const finalIndex = operations.lastIndexOf(finalCreate!);
+    assert.equal(progressIndex >= 0 && progressIndex < finalIndex, true);
+    assert.ok(operations.some((operation) => operation.type === 'delete'));
   });
 
   it('replaces all content previews with one final card for complex markdown', async () => {
