@@ -853,7 +853,63 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
+    // Update the tool-progress bubble FIRST (state must still exist), then
+    // check for a tool boundary (Hermes on_segment_break): when a NEW tool
+    // starts running, finalize the current text message so subsequent text
+    // appears as a fresh message below the tool progress bubble. This stops
+    // the text message from growing unboundedly across many tool calls.
+    const state = this.activeCards.get(chatId);
+    const hasNewTool = state && state.pendingText
+      ? tools.some((t) => t.status === 'running' && !new Set(state.toolCalls.map((t2) => t2.id)).has(t.id))
+      : false;
     this.updateToolProgress(chatId, tools);
+    if (hasNewTool) {
+      this.segmentBreak(chatId);
+    }
+  }
+
+  /**
+   * Hermes-style segment break: finalize the current streaming text message
+   * as-is (no status footer), then reset so the next onStreamText delta is
+   * rendered into a brand-new message. Tool-progress bubbles and edit
+   * accounting carry across the break.
+   */
+  private segmentBreak(chatId: string): void {
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient || !state.pendingText) return;
+
+    const fullText = state.pendingText;
+    // Quiet finalize: edit current message to its full text (no footer).
+    this.restClient.im.message.update({
+      path: { message_id: state.messageId },
+      data: { msg_type: 'post', content: buildPostContent(fullText) },
+    }).catch((err: unknown) => {
+      console.warn('[feishu-adapter] segment-break finalize failed:', err instanceof Error ? err.message : err);
+    });
+
+    // Carry tool-progress bubble + edit accounting into the next message.
+    const carryProgressMsgId = state.toolProgressMsgId;
+    const carryProgressLines = state.progressLines;
+    const carryLastProgressEditAt = state.lastProgressEditAt;
+    const carryProgressEditCount = state.progressEditCount;
+    const carryBaseLength = fullText.length;
+
+    this.activeCards.delete(chatId);
+    const replyTo = this.lastIncomingMessageId.get(chatId);
+    this.createStreamingCard(chatId, replyTo).then((ok) => {
+      if (!ok) return;
+      const st = this.activeCards.get(chatId);
+      if (st) {
+        st.baseLength = carryBaseLength;
+        st.toolProgressMsgId = carryProgressMsgId;
+        st.progressLines = carryProgressLines;
+        st.lastProgressEditAt = carryLastProgressEditAt;
+        st.progressEditCount = carryProgressEditCount;
+        if (st.progressLines.length > 0) {
+          this.flushToolProgress(chatId);
+        }
+      }
+    }).catch(() => {});
   }
 
   async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
