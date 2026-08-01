@@ -456,14 +456,19 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const name = tc.name || 'tool';
       const input = tc.input || '';
       const { emoji, verb } = lookupToolDisplay(name);
+      const displayVerb = tc.status === 'running'
+        ? verb
+        : tc.status === 'complete'
+          ? 'Completed'
+          : 'Failed';
       const isTerminal = /bash|shell|terminal|codex_shell|^run$/i.test(name);
       if (isTerminal && input) {
         const cmd = input.includes('\n') ? `${input.split('\n')[0].slice(0, 60)} ...` : input;
-        lines.push(`${icon} ${emoji} ${verb}\n\`\`\`\n${cmd}\n\`\`\``);
+        lines.push(`${icon} ${emoji} ${displayVerb}\n\`\`\`\n${cmd}\n\`\`\``);
       } else if (input) {
-        lines.push(`${icon} ${emoji} ${verb} \`${input}\``);
+        lines.push(`${icon} ${emoji} ${displayVerb} \`${input}\``);
       } else {
-        lines.push(`${icon} ${emoji} ${verb}`);
+        lines.push(`${icon} ${emoji} ${displayVerb}`);
       }
     }
     return lines;
