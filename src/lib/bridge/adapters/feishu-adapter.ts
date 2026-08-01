@@ -73,6 +73,8 @@ interface FeishuCardState {
   lastProgressEditAt: number;
   /** Independent throttle timer for the tool-progress bubble. */
   progressThrottleTimer: ReturnType<typeof setTimeout> | null;
+  /** Edit count for the tool-progress bubble — Feishu caps edits per message at 20. */
+  progressEditCount: number;
 }
 
 /** Streaming update throttle interval (ms). */
@@ -82,6 +84,9 @@ const CARD_THROTTLE_MS = 500;
  *  Feishu's edit-message API allows at most 20 edits per message; we stay
  *  well under with room for the finalize edit. */
 const MAX_EDITS_PER_MESSAGE = 12;
+
+/** Max edits for the tool-progress bubble before it segments (same 20 cap). */
+const MAX_PROGRESS_EDITS = 15;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -438,6 +443,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         progressLines: [],
         lastProgressEditAt: 0,
         progressThrottleTimer: null,
+        progressEditCount: 0,
       });
 
       console.log(`[feishu-adapter] Streaming message created: msgId=${messageId}`);
@@ -515,6 +521,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
           st.toolProgressMsgId = carryProgressMsgId;
           st.progressLines = carryProgressLines;
           st.lastProgressEditAt = state.lastProgressEditAt;
+          st.progressEditCount = state.progressEditCount;
           if (st.progressLines.length > 0) {
             // Keep rendering the carried lines (status updates still land here).
             this.flushToolProgress(chatId);
@@ -628,6 +635,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const content = buildPostContent(state.progressLines.join('\n'));
 
     if (state.toolProgressMsgId) {
+      // Feishu caps edits per message at 20 — segment the bubble when we
+      // approach the cap: keep the old bubble as-is and start a fresh one
+      // on the next flush (toolProgressMsgId reset → create path).
+      if (state.progressEditCount >= MAX_PROGRESS_EDITS) {
+        state.toolProgressMsgId = null;
+        state.progressEditCount = 0;
+        // Re-dispatch so the current lines land in a fresh bubble.
+        this.flushToolProgress(chatId);
+        return;
+      }
       // Edit existing bubble.
       this.restClient.im.message.update({
         path: { message_id: state.toolProgressMsgId },
@@ -637,6 +654,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }).catch((err: unknown) => {
         console.warn('[feishu-adapter] tool progress update failed:', err instanceof Error ? err.message : err);
       });
+      state.progressEditCount++;
       return;
     }
 
@@ -647,9 +665,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const existingCreate = this.toolProgressCreatePromises.get(chatId);
     if (existingCreate) {
       existingCreate.then(() => {
-        // Re-run flush now that toolProgressMsgId should be set; if creation
-        // failed, keep the lines buffered for a later retry.
-        if (this.activeCards.get(chatId)?.toolProgressMsgId) {
+        // Re-run flush when creation resolved. toolProgressMsgId is set on
+        // success (edit path); on segmentation reset it is null but lines are
+        // buffered — retry the create path rather than dropping the update.
+        const st = this.activeCards.get(chatId);
+        if (st && (st.toolProgressMsgId || st.progressLines.length > 0)) {
           this.flushToolProgress(chatId);
         }
       }).catch(() => {});
