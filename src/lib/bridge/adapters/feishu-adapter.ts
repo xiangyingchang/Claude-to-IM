@@ -27,6 +27,7 @@ import type { FileAttachment } from '../types.js';
 import type { ToolCallInfo } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
+import { lookupToolDisplay } from '../tool-display.js';
 import {
   htmlToFeishuMarkdown,
   preprocessFeishuMarkdown,
@@ -134,6 +135,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private lastIncomingMessageId = new Map<string, string>();
   /** Track active typing reaction IDs per chat for cleanup. */
   private typingReactions = new Map<string, string>();
+  /** In-flight guard for standalone tool-progress bubble creation (avoids duplicate bubbles on parallel tool events). */
+  private toolProgressCreatePromises = new Map<string, Promise<void>>();
   /** Active streaming card state per chatId. */
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
@@ -543,11 +546,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   /**
    * Update tool progress — Hermes-style: render tool calls as a standalone
-   * progress bubble (with command code blocks) separate from the text stream,
-   * instead of embedding them inside the streaming text message.
-   *
-   * The bubble is created on the first tool event and edited in place with
-   * throttling, mirroring Hermes' send_progress_messages().
+   * progress bubble (emoji + verb + preview, bash commands as fenced code
+   * blocks) separate from the text stream, mirroring Hermes'
+   * send_progress_messages(). The bubble is created on the first tool event
+   * and edited in place with throttling.
    */
   private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
     const state = this.activeCards.get(chatId);
@@ -555,26 +557,25 @@ export class FeishuAdapter extends BaseChannelAdapter {
     state.toolCalls = tools;
 
     // Build compact progress lines (one per tool), Hermes-style:
-    //   💻 terminal  /  🔍 web_search  /  ✏️ edit
+    //   📖 Reading feishu-adapter.ts L218-247
+    //   💻 Running git status        (bash → fenced code block)
+    //   ✏️ Editing file.ts
     // Running tool gets 🔄 prefix; completed ✅; failed ❌.
-    // Bash/terminal commands render as fenced code blocks.
     const lines: string[] = [];
     for (const tc of tools) {
       const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
       const name = tc.name || 'tool';
       const input = tc.input || '';
+      const { emoji, verb } = lookupToolDisplay(name);
       const isTerminal = /bash|shell|terminal|codex_shell/i.test(name);
-      if (isTerminal && input && !input.includes('\n')) {
-        // Single-line command → fenced code block
-        lines.push(`${icon} **${name}**\n\`\`\`\n${input}\n\`\`\``);
-      } else if (isTerminal && input) {
-        // Multi-line command → first line + ellipsis
-        const first = input.split('\n')[0].slice(0, 60);
-        lines.push(`${icon} **${name}**\n\`\`\`\n${first} ...\n\`\`\``);
+      if (isTerminal && input) {
+        // Terminal command → header + fenced code block (Hermes style).
+        const cmd = input.includes('\n') ? `${input.split('\n')[0].slice(0, 60)} ...` : input;
+        lines.push(`${icon} ${emoji} ${verb}\n\`\`\`\n${cmd}\n\`\`\``);
       } else if (input) {
-        lines.push(`${icon} **${name}** \`${input}\``);
+        lines.push(`${icon} ${emoji} ${verb} \`${input}\``);
       } else {
-        lines.push(`${icon} **${name}**`);
+        lines.push(`${icon} ${emoji} ${verb}`);
       }
     }
 
@@ -603,6 +604,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   /**
    * Create or edit the standalone tool-progress bubble.
    * First call creates a new post message; later calls edit it in place.
+   * In-flight guarded: parallel tool events before the first create resolves
+   * must NOT spawn duplicate bubbles (race found in code review).
    */
   private flushToolProgress(chatId: string): void {
     const state = this.activeCards.get(chatId);
@@ -623,8 +626,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return;
     }
 
+    // In-flight guard: if a create is already pending for this chat, wait for
+    // it (then the next flush will edit the now-existing bubble). This prevents
+    // duplicate bubbles when several tool events arrive before the first
+    // im.message.create resolves (very common with parallel tool calls).
+    const existingCreate = this.toolProgressCreatePromises.get(chatId);
+    if (existingCreate) {
+      existingCreate.then(() => {
+        // Re-run flush now that toolProgressMsgId should be set; if creation
+        // failed, keep the lines buffered for a later retry.
+        if (this.activeCards.get(chatId)?.toolProgressMsgId) {
+          this.flushToolProgress(chatId);
+        }
+      }).catch(() => {});
+      return;
+    }
+
     // Create a new bubble (first tool event).
-    this.restClient.im.message.create({
+    const createPromise = this.restClient.im.message.create({
       params: { receive_id_type: 'chat_id' },
       data: { receive_id: chatId, msg_type: 'post', content },
     }).then((res) => {
@@ -635,7 +654,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
     }).catch((err: unknown) => {
       console.warn('[feishu-adapter] tool progress create failed:', err instanceof Error ? err.message : err);
+    }).finally(() => {
+      this.toolProgressCreatePromises.delete(chatId);
     });
+
+    this.toolProgressCreatePromises.set(chatId, createPromise);
   }
 
   /**

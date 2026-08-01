@@ -16,6 +16,7 @@ import type {
   MessageContentBlock,
 } from './host.js';
 import { getBridgeContext } from './context.js';
+import { buildToolPreview } from './tool-display.js';
 import crypto from 'crypto';
 
 export interface PermissionRequestInfo {
@@ -46,40 +47,11 @@ export type OnPartialText = (fullText: string) => void;
 export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', toolInput?: string) => void;
 
 /**
+ * @deprecated Use buildToolPreview / buildToolDisplayLine from './tool-display.js'.
  * Build a short human-readable summary of a tool input for execution records.
- * - Bash: the shell command (first line, truncated)
- * - Edit/Write: the file path
- * - Others: JSON-ish single-line preview
  */
 export function summarizeToolInput(name: string, input: unknown): string {
-  try {
-    if (input == null) return '';
-    if (typeof input === 'string') return input.slice(0, 120);
-    const obj = input as Record<string, unknown>;
-    if (typeof obj !== 'object' || Array.isArray(obj)) {
-      return String(input).slice(0, 120);
-    }
-    const lower = name.toLowerCase();
-    if (lower === 'bash' || lower === 'shell' || lower === 'codex_shell' || lower === 'terminal') {
-      const cmd = (obj.command ?? obj.cmd ?? obj.script ?? '') as string;
-      return String(cmd).replace(/\n/g, ' ').slice(0, 120);
-    }
-    if (lower === 'edit' || lower === 'write' || lower === 'file_write' || lower === 'multi_edit') {
-      const fp = (obj.file_path ?? obj.filePath ?? obj.path ?? obj.file ?? '') as string;
-      if (fp) return String(fp).slice(0, 120);
-    }
-    // Generic: pick the most informative scalar fields
-    const picks = ['command', 'file_path', 'filePath', 'path', 'url', 'query', 'prompt', 'code', 'text'];
-    for (const k of picks) {
-      const v = obj[k];
-      if (v != null && typeof v === 'string' && v.trim()) {
-        return String(v).replace(/\n/g, ' ').slice(0, 120);
-      }
-    }
-    return '';
-  } catch {
-    return '';
-  }
+  return buildToolPreview(name, input);
 }
 
 export interface ConversationResult {
@@ -292,7 +264,7 @@ async function consumeStream(
                 input: toolData.input,
               });
               if (onToolEvent) {
-                try { onToolEvent(toolData.id, toolData.name, 'running', summarizeToolInput(toolData.name, toolData.input)); } catch { /* non-critical */ }
+                try { onToolEvent(toolData.id, toolData.name, 'running', buildToolPreview(toolData.name, toolData.input)); } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;
