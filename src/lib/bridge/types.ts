@@ -178,6 +178,36 @@ export interface ToolCallInfo {
   input?: string;
 }
 
+/**
+ * Ordered events emitted while one assistant turn is streamed.
+ *
+ * The legacy bridge callbacks expose accumulated text and the full tool list.
+ * That is sufficient for a single editable preview, but it loses the exact
+ * visible order needed by message-based channels such as Feishu.  These
+ * events are additive: adapters that do not implement the ordered contract
+ * continue to receive the legacy callbacks.
+ */
+export type StreamEvent =
+  | {
+      type: 'text';
+      /** Full assistant text accumulated across all text blocks so far. */
+      fullText: string;
+      sequence: number;
+    }
+  | {
+      type: 'tool_start';
+      toolId: string;
+      toolName: string;
+      toolInput?: string;
+      sequence: number;
+    }
+  | {
+      type: 'tool_end';
+      toolId: string;
+      status: 'complete' | 'error';
+      sequence: number;
+    };
+
 // ── Config ─────────────────────────────────────────────────────
 
 /** Platform-specific message length limits */

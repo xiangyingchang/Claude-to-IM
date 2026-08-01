@@ -22,6 +22,7 @@ import type {
   InboundMessage,
   OutboundMessage,
   SendResult,
+  StreamEvent,
 } from '../types.js';
 import type { FileAttachment } from '../types.js';
 import type { ToolCallInfo } from '../types.js';
@@ -119,13 +120,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     };
 
     this.streamCoordinator = new FeishuStreamCoordinator(transport, {
-      post: (text) => buildPostContent(text),
-      progress: (tools) => {
-        const lines = this.buildToolProgressLines(tools);
-        return { lines, content: buildPostContent(lines.join('\n')) };
-      },
-      finalizeProgress: (content) => content.replace(/🔄/g, '✅'),
-      finalCard: (text, tools, footer) => buildFinalCardJson(text, tools, footer),
+      post: (text) => buildPostContent(preprocessFeishuMarkdown(text)),
+      tools: (tools) => buildPostContent(this.buildToolGroupContent(tools)),
+      finalCard: (text, footer) => buildFinalCardJson(text, [], footer),
       hasComplexMarkdown,
     }, {
       onError: (scope, error) => {
@@ -269,7 +266,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   // ── Typing indicator (Openclaw-style reaction) ─────────────
 
   /**
-   * Add a "Typing" emoji reaction to the user's message and create streaming card.
+   * Add a "Typing" emoji reaction to the user's message and start the
+   * streaming message timeline.
    * Called by bridge-manager via onMessageStart().
    */
   onMessageStart(chatId: string): void {
@@ -297,7 +295,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Remove the "Typing" emoji reaction and clean up card state.
+   * Remove the "Typing" emoji reaction and clean up timeline state.
    * Called by bridge-manager via onMessageEnd().
    */
   onMessageEnd(chatId: string): void {
@@ -474,16 +472,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
     return lines;
   }
 
+  /** Render one contiguous tool phase as one editable Feishu message. */
+  private buildToolGroupContent(tools: ToolCallInfo[]): string {
+    const lines = this.buildToolProgressLines(tools);
+    return `🔧 执行过程（${tools.length} 个工具）\n\n${lines.join('\n\n')}`;
+  }
+
   hasActiveCard(chatId: string): boolean {
     return this.streamCoordinator.hasActive(chatId);
   }
 
-  onStreamText(chatId: string, fullText: string): void {
-    this.streamCoordinator.onText(chatId, fullText);
-  }
-
-  onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
-    this.streamCoordinator.onTools(chatId, tools);
+  onStreamEvent(chatId: string, event: StreamEvent): void {
+    this.streamCoordinator.onEvent(chatId, event);
   }
 
   /** Flushes streaming writes before an ordered permission card is sent. */

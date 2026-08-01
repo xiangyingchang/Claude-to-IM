@@ -7,7 +7,7 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
-import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
+import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, StreamEvent, ToolCallInfo } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
 // Side-effect import: triggers self-registration of all adapter factories
@@ -690,18 +690,20 @@ async function handleMessage(
   } : undefined;
 
   // ── Streaming preview setup ───────────────────────────────────
-  // If the adapter supports a streaming preview (e.g. Feishu), wire up
-  // onStreamText, onToolEvent, and onStreamEnd callbacks.
-  // These run in parallel with the existing preview system — Feishu
-  // uses cards instead of message edit for streaming.
-  const hasStreamingCards = typeof adapter.onStreamText === 'function';
+  // If the adapter supports a streaming timeline (e.g. Feishu), wire up the
+  // ordered event contract. Legacy adapters keep receiving accumulated text
+  // and the full tool list. Feishu implements both capability detection and
+  // event delivery through onStreamEvent, so it never receives duplicate
+  // legacy callbacks for the same SSE event.
+  const hasOrderedStream = typeof adapter.onStreamEvent === 'function';
+  const hasStreamingCards = hasOrderedStream || typeof adapter.onStreamText === 'function';
   const toolCallTracker = new Map<string, ToolCallInfo>();
 
-  const onStreamCardText = hasStreamingCards ? (fullText: string) => {
+  const onStreamCardText = !hasOrderedStream && typeof adapter.onStreamText === 'function' ? (fullText: string) => {
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
   } : undefined;
 
-  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', toolInput?: string) => {
+  const onToolEvent = !hasOrderedStream && typeof adapter.onToolEvent === 'function' ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', toolInput?: string) => {
     if (toolName) {
       toolCallTracker.set(toolId, { id: toolId, name: toolName, status, input: toolInput || undefined });
     } else {
@@ -712,6 +714,10 @@ async function handleMessage(
     try {
       adapter.onToolEvent!(msg.address.chatId, Array.from(toolCallTracker.values()));
     } catch { /* non-critical */ }
+  } : undefined;
+
+  const onStreamEvent = hasOrderedStream ? (event: StreamEvent) => {
+    try { adapter.onStreamEvent!(msg.address.chatId, event); } catch { /* non-critical */ }
   } : undefined;
 
   // Combined partial text callback: streaming preview + streaming cards
@@ -740,7 +746,7 @@ async function handleMessage(
         perm.suggestions,
         msg.messageId,
       );
-    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent);
+    }, taskAbort.signal, hasAttachments ? msg.attachments : undefined, onPartialText, onToolEvent, onStreamEvent);
 
     // Finalize streaming card if adapter supports it.
     // onStreamEnd awaits any in-flight card creation and returns true if a card

@@ -11,6 +11,7 @@ import type {
   OutboundMessage,
   PreviewCapabilities,
   SendResult,
+  StreamEvent,
 } from './types.js';
 
 export abstract class BaseChannelAdapter {
@@ -108,6 +109,12 @@ export abstract class BaseChannelAdapter {
    * Adapter can use this to display tool progress beside the text preview.
    */
   onToolEvent?(_chatId: string, _tools: import('./types.js').ToolCallInfo[]): void;
+
+  /**
+   * Called for each ordered stream event. Adapters that need a message-level
+   * timeline can implement this instead of combining the legacy callbacks.
+   */
+  onStreamEvent?(_chatId: string, _event: StreamEvent): void;
 
   /**
    * Flush all pending streaming writes before an ordered outbound message,

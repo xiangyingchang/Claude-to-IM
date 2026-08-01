@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import type { ToolCallInfo } from '../../lib/bridge/types.js';
+import type { StreamEvent, ToolCallInfo } from '../../lib/bridge/types.js';
 import {
   FeishuStreamCoordinator,
   type FeishuStreamRenderer,
@@ -61,19 +61,14 @@ function createHarness(
   };
 
   const renderer: FeishuStreamRenderer = {
-    post: (text) => `post:${text}`,
-    progress: (tools: ToolCallInfo[]) => {
-      const lines = tools.map((tool) => `${tool.status}:${tool.id}`);
-      return { lines, content: `progress:${lines.join('|')}` };
-    },
-    finalizeProgress: (content) => content.replaceAll('running', 'complete'),
-    finalCard: (text, _tools, footer) => `card:${text}|${footer.status}|${footer.elapsed}`,
-    hasComplexMarkdown: (text) => text.includes('```'),
+    post: (text: string) => `post:${text}`,
+    tools: (tools: ToolCallInfo[]) => `tools:${tools.map((tool) => `${tool.status}:${tool.id}`).join('|')}`,
+    finalCard: (text: string, footer: { status: string; elapsed: string }) => `card:${text}|${footer.status}|${footer.elapsed}`,
+    hasComplexMarkdown: (text: string) => text.includes('```'),
   };
 
   const coordinator = new FeishuStreamCoordinator(transport, renderer, {
     contentThrottleMs: 0,
-    progressThrottleMs: 0,
     now: () => 1000,
     ...options,
   });
@@ -81,39 +76,75 @@ function createHarness(
   return { coordinator, operations, getMaxActiveWrites: () => maxActiveWrites };
 }
 
-async function flush(coordinator: FeishuStreamCoordinator, chatId = 'chat-1'): Promise<void> {
-  await coordinator.flush(chatId);
+function emit(coordinator: FeishuStreamCoordinator, event: StreamEvent, chatId = 'chat-1'): void {
+  coordinator.onEvent(chatId, event);
 }
 
-function tool(id: string, status: ToolCallInfo['status'] = 'running'): ToolCallInfo {
-  return { id, name: 'Bash', status, input: `echo ${id}` };
+function text(sequence: number, fullText: string): StreamEvent {
+  return { type: 'text', fullText, sequence };
+}
+
+function toolStart(sequence: number, toolId: string): StreamEvent {
+  return { type: 'tool_start', toolId, toolName: 'Bash', toolInput: `echo ${toolId}`, sequence };
+}
+
+function toolEnd(sequence: number, toolId: string, status: 'complete' | 'error' = 'complete'): StreamEvent {
+  return { type: 'tool_end', toolId, status, sequence };
 }
 
 describe('FeishuStreamCoordinator', () => {
-  it('keeps content and tool bubbles in Hermes order without repeating prefixes', async () => {
+  it('groups consecutive tools into one message between text messages', async () => {
     const { coordinator, operations } = createHarness();
 
     coordinator.start('chat-1', 'in-1');
-    coordinator.onText('chat-1', 'A');
-    coordinator.onTools('chat-1', [tool('1')]);
-    coordinator.onTools('chat-1', [tool('1', 'complete')]);
-    coordinator.onText('chat-1', 'AB');
-    coordinator.onTools('chat-1', [tool('1', 'complete'), tool('2')]);
-    coordinator.onText('chat-1', 'ABC');
-    await flush(coordinator);
+    emit(coordinator, text(1, 'A'));
+    emit(coordinator, toolStart(2, '1'));
+    emit(coordinator, toolEnd(3, '1'));
+    emit(coordinator, toolStart(4, '2'));
+    emit(coordinator, toolEnd(5, '2'));
+    emit(coordinator, text(6, 'AB'));
+    emit(coordinator, text(7, 'ABC'));
+    const delivered = await coordinator.end('chat-1', 'completed', 'ABC');
 
+    assert.equal(delivered, true);
     const creates = operations.filter((operation) => operation.type === 'create');
-    const updates = operations.filter((operation) => operation.type === 'update');
-    assert.equal(creates[0]?.content, 'post:💭 Thinking...');
-    assert.ok(creates.some((operation) => operation.content?.startsWith('progress:running:1')));
-    assert.ok(creates.some((operation) => operation.content?.includes('running:2')));
+    const groupCreates = creates.filter((operation) => operation.content?.startsWith('tools:'));
+    assert.equal(groupCreates.length, 1, 'two tools in one contiguous phase must create one group message');
+    assert.equal(groupCreates[0]?.content, 'tools:running:1');
 
-    const textUpdates = updates.filter((operation) => operation.content?.startsWith('post:'));
-    assert.ok(textUpdates.some((operation) => operation.content === 'post:A'));
-    assert.ok(textUpdates.some((operation) => operation.content === 'post:B'));
-    assert.ok(textUpdates.some((operation) => operation.content === 'post:C'));
-    assert.equal(textUpdates.some((operation) => operation.content === 'post:AB'), false);
-    assert.equal(textUpdates.some((operation) => operation.content === 'post:ABC'), false);
+    const groupId = groupCreates[0]?.id;
+    assert.ok(groupId);
+    assert.ok(operations.some((operation) => operation.type === 'update' && operation.id === groupId && operation.content === 'tools:complete:1|complete:2'));
+
+    const finalIndex = operations.findIndex((operation) => operation.type === 'create' && operation.content?.startsWith('post:BC\n\n'));
+    const groupLastIndex = operations.reduce((last, operation, index) => operation.id === groupId ? index : last, -1);
+    assert.ok(groupLastIndex >= 0 && groupLastIndex < finalIndex, 'final message must be created after the tool group');
+
+    // The staging text after the last tool is removed; the execution group is kept.
+    assert.ok(operations.some((operation) => operation.type === 'delete' && operation.id !== groupId));
+    assert.equal(operations.filter((operation) => operation.type === 'interactive').length, 0);
+  });
+
+  it('opens a new tool-group message after a later text segment', async () => {
+    const { coordinator, operations } = createHarness();
+
+    coordinator.start('chat-1');
+    emit(coordinator, text(1, 'before'));
+    emit(coordinator, toolStart(2, '1'));
+    emit(coordinator, toolEnd(3, '1'));
+    emit(coordinator, text(4, 'beforemiddle'));
+    emit(coordinator, toolStart(5, '2'));
+    emit(coordinator, toolEnd(6, '2'));
+    emit(coordinator, text(7, 'beforemiddleafter'));
+    const delivered = await coordinator.end('chat-1', 'completed', 'beforemiddleafter');
+
+    assert.equal(delivered, true);
+    const groups = operations.filter((operation) => operation.type === 'create' && operation.content?.startsWith('tools:'));
+    assert.equal(groups.length, 2);
+    const group1Index = operations.indexOf(groups[0]!);
+    const group2Index = operations.indexOf(groups[1]!);
+    assert.ok(group1Index < group2Index);
+    assert.equal(operations.filter((operation) => operation.type === 'create' && operation.content?.startsWith('post:before')).length, 1);
   });
 
   it('serializes all network writes for a chat', async () => {
@@ -121,30 +152,32 @@ describe('FeishuStreamCoordinator', () => {
     const { coordinator } = harness;
 
     coordinator.start('chat-1');
-    coordinator.onText('chat-1', 'one');
-    coordinator.onText('chat-1', 'two');
-    coordinator.onText('chat-1', 'three');
-    await flush(coordinator);
+    emit(coordinator, text(1, 'one'));
+    emit(coordinator, text(2, 'two'));
+    emit(coordinator, text(3, 'three'));
+    emit(coordinator, toolStart(4, '1'));
+    emit(coordinator, toolEnd(5, '1'));
+    await coordinator.end('chat-1', 'completed', 'three');
 
     assert.equal(harness.getMaxActiveWrites(), 1);
   });
 
-  it('rolls over before the edit budget can hit Feishu limit', async () => {
+  it('rolls over text before the edit budget is exhausted', async () => {
     const { coordinator, operations } = createHarness({ maxEditsPerMessage: 2 });
 
     coordinator.start('chat-1');
-    coordinator.onText('chat-1', 'A');
-    coordinator.onText('chat-1', 'AB');
-    coordinator.onText('chat-1', 'ABC');
-    await flush(coordinator);
+    emit(coordinator, text(1, 'A'));
+    emit(coordinator, text(2, 'AB'));
+    emit(coordinator, text(3, 'ABC'));
+    emit(coordinator, text(4, 'ABCD'));
+    await coordinator.end('chat-1', 'completed', 'ABCD');
 
     const creates = operations.filter((operation) => operation.type === 'create');
-    assert.equal(creates.length, 2);
-    assert.equal(creates[1]?.content, 'post:C');
+    assert.ok(creates.some((operation) => operation.content === 'post:D'));
     assert.equal(operations.filter((operation) => operation.type === 'update').length, 2);
   });
 
-  it('falls back to a fresh post when Feishu rejects an edit with 230072', async () => {
+  it('falls back to a fresh text segment when Feishu rejects an edit with 230072', async () => {
     let failed = false;
     const { coordinator, operations } = createHarness({}, () => {
       if (failed) return null;
@@ -155,44 +188,43 @@ describe('FeishuStreamCoordinator', () => {
     });
 
     coordinator.start('chat-1');
-    coordinator.onText('chat-1', 'A');
-    await flush(coordinator);
+    emit(coordinator, text(1, 'A'));
+    emit(coordinator, text(2, 'AB'));
+    await coordinator.end('chat-1', 'completed', 'AB');
 
-    const creates = operations.filter((operation) => operation.type === 'create');
-    assert.equal(creates.length, 2);
-    assert.equal(creates[1]?.content, 'post:A');
+    assert.ok(operations.some((operation) => operation.type === 'create' && operation.content === 'post:B'));
     assert.equal(operations.filter((operation) => operation.type === 'update').length, 0);
   });
 
-  it('puts the final answer after tool progress and removes fragmented previews', async () => {
+  it('keeps the process messages and puts a complex Markdown final card last', async () => {
     const { coordinator, operations } = createHarness();
 
     coordinator.start('chat-1');
-    coordinator.onText('chat-1', 'A');
-    coordinator.onTools('chat-1', [tool('1')]);
-    coordinator.onText('chat-1', 'AB');
-    const delivered = await coordinator.end('chat-1', 'completed', 'AB');
+    emit(coordinator, text(1, '先说明'));
+    emit(coordinator, toolStart(2, '1'));
+    emit(coordinator, toolEnd(3, '1'));
+    emit(coordinator, text(4, '先说明\n\n最终 ```ts\nconst x = 1;\n```'));
+    const delivered = await coordinator.end('chat-1', 'completed', '先说明\n\n最终 ```ts\nconst x = 1;\n```');
 
     assert.equal(delivered, true);
-    const finalCreate = operations
-      .filter((operation) => operation.type === 'create')
-      .at(-1);
-    assert.equal(finalCreate?.content?.includes('post:AB'), true);
-    const progressIndex = operations.findIndex((operation) => operation.content?.startsWith('progress:'));
-    const finalIndex = operations.lastIndexOf(finalCreate!);
-    assert.equal(progressIndex >= 0 && progressIndex < finalIndex, true);
+    const interactiveIndex = operations.findIndex((operation) => operation.type === 'interactive');
+    assert.ok(interactiveIndex > operations.findIndex((operation) => operation.type === 'create' && operation.content?.startsWith('tools:')));
+    assert.equal(operations.filter((operation) => operation.type === 'interactive').length, 1);
     assert.ok(operations.some((operation) => operation.type === 'delete'));
   });
 
-  it('replaces all content previews with one final card for complex markdown', async () => {
+  it('ignores stale events so a late callback cannot reopen an old group', async () => {
     const { coordinator, operations } = createHarness();
 
     coordinator.start('chat-1');
-    coordinator.onText('chat-1', 'answer ```ts\nconst x = 1;\n```');
-    const delivered = await coordinator.end('chat-1', 'completed', 'answer ```ts\nconst x = 1;\n```');
+    emit(coordinator, text(2, 'A'));
+    emit(coordinator, toolStart(3, '1'));
+    emit(coordinator, text(4, 'AB'));
+    emit(coordinator, toolStart(3, 'late'));
+    await coordinator.end('chat-1', 'completed', 'AB');
 
-    assert.equal(delivered, true);
-    assert.equal(operations.filter((operation) => operation.type === 'interactive').length, 1);
-    assert.ok(operations.some((operation) => operation.type === 'delete'));
+    const groups = operations.filter((operation) => operation.type === 'create' && operation.content?.startsWith('tools:'));
+    assert.equal(groups.length, 1);
+    assert.equal(groups[0]?.content, 'tools:running:1');
   });
 });

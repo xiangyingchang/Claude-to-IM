@@ -1,4 +1,4 @@
-import type { ToolCallInfo } from '../types.js';
+import type { StreamEvent, ToolCallInfo } from '../types.js';
 
 export type FeishuStreamStatus = 'completed' | 'interrupted' | 'error';
 
@@ -9,77 +9,83 @@ export interface FeishuStreamTransport {
   deleteMessage(messageId: string): Promise<void>;
 }
 
-export interface FeishuProgressRender {
-  lines: string[];
-  content: string;
-}
-
 export interface FeishuStreamRenderer {
   post(text: string): string;
-  progress(tools: ToolCallInfo[]): FeishuProgressRender;
-  finalizeProgress(content: string): string;
-  finalCard(text: string, tools: ToolCallInfo[], footer: { status: string; elapsed: string }): string;
+  /** Render one contiguous group of tool executions as one message. */
+  tools(tools: ToolCallInfo[]): string;
+  finalCard(text: string, footer: { status: string; elapsed: string }): string;
   hasComplexMarkdown(text: string): boolean;
 }
 
 export interface FeishuStreamCoordinatorOptions {
   contentThrottleMs?: number;
-  progressThrottleMs?: number;
   maxEditsPerMessage?: number;
-  maxProgressEditsPerMessage?: number;
+  maxToolGroupEditsPerMessage?: number;
   now?: () => number;
   onError?: (scope: string, error: unknown) => void;
+}
+
+interface TextSegment {
+  messageId: string;
+  /** Global text offset represented by this segment. */
+  baseLength: number;
+  /** Number of the tool group that preceded this segment. */
+  toolGroupSerial: number;
+  sentText: string;
+  sentContent: string;
+  editCount: number;
+  lastUpdateAt: number;
+}
+
+interface ToolGroup {
+  serial: number;
+  messageId: string | null;
+  tools: ToolCallInfo[];
+  lastSentContent: string;
+  editCount: number;
 }
 
 interface StreamState {
   chatId: string;
   replyToMessageId?: string;
+  firstMessagePending: boolean;
   startTime: number;
 
-  /** The latest full assistant text received from the engine. */
+  /** Full assistant text received from the engine. */
   pendingText: string;
-  /** Global-text offset represented by the current content message. */
-  baseLength: number;
-  /** Raw text currently represented by the current content message. */
-  currentSegmentText: string;
-  /** Whether the current message has been closed at a tool boundary. */
-  segmentClosed: boolean;
-  thinking: boolean;
-
-  currentMessageId: string | null;
-  contentMessageIds: string[];
-  contentEditCount: number;
-  lastContentUpdateAt: number;
-  lastSentContent: string;
-  lastSentText: string;
+  /** Global offset represented by the current text segment. */
+  segmentBaseLength: number;
+  currentSegment: TextSegment | null;
+  textSegments: TextSegment[];
   contentTimer: ReturnType<typeof setTimeout> | null;
 
-  toolCalls: ToolCallInfo[];
-  progressMessageId: string | null;
-  progressMessageIds: string[];
-  progressLines: string[];
-  lastProgressContent: string;
-  lastProgressUpdateAt: number;
-  progressEditCount: number;
-  progressTimer: ReturnType<typeof setTimeout> | null;
+  /** At most one active group exists between two text segments. */
+  currentToolGroup: ToolGroup | null;
+  toolGroupSerial: number;
+  completedToolGroupMessageIds: string[];
+  lastSequence: number;
+
+  finalMessageId: string | null;
+  finalized: boolean;
 }
 
 /**
- * Serializes all Feishu writes for one chat and models the visible stream as
- * content segments separated by tool-progress bubbles.
+ * Serializes every Feishu write for one chat and materializes the ordered
+ * assistant timeline:
  *
- * The coordinator deliberately accepts the engine's accumulated text API for
- * compatibility with the bridge. It owns the segment offset, so a boundary
- * can never accidentally write the whole accumulated answer into the next
- * message.
+ *   text message -> one contiguous tool-group message -> text message -> final
+ *
+ * A tool group may contain any number of tool calls. It is opened by the first
+ * tool_start event, updated as more tools start/finish, and sealed only when a
+ * later visible text event arrives. This is the message granularity used by
+ * the ChatGPT/Codex execution view and avoids one-message-per-tool spam.
  */
 export class FeishuStreamCoordinator {
   private readonly transport: FeishuStreamTransport;
   private readonly renderer: FeishuStreamRenderer;
   private readonly contentThrottleMs: number;
-  private readonly progressThrottleMs: number;
   private readonly maxEditsPerMessage: number;
-  private readonly maxProgressEditsPerMessage: number;
+  private readonly maxToolGroupEditsPerMessage: number;
   private readonly now: () => number;
   private readonly onError?: (scope: string, error: unknown) => void;
 
@@ -94,97 +100,47 @@ export class FeishuStreamCoordinator {
     this.transport = transport;
     this.renderer = renderer;
     this.contentThrottleMs = options.contentThrottleMs ?? 500;
-    this.progressThrottleMs = options.progressThrottleMs ?? 1500;
     this.maxEditsPerMessage = options.maxEditsPerMessage ?? 12;
-    this.maxProgressEditsPerMessage = options.maxProgressEditsPerMessage ?? 15;
+    this.maxToolGroupEditsPerMessage = options.maxToolGroupEditsPerMessage ?? 15;
     this.now = options.now ?? Date.now;
     this.onError = options.onError;
   }
 
   start(chatId: string, replyToMessageId?: string): void {
     void this.enqueue(chatId, async () => {
-      await this.ensureState(chatId, replyToMessageId);
+      this.ensureState(chatId, replyToMessageId);
     });
   }
 
-  onText(chatId: string, fullText: string): void {
+  /** Consume one ordered text/tool event from the engine. */
+  onEvent(chatId: string, event: StreamEvent): void {
     void this.enqueue(chatId, async () => {
-      const state = await this.ensureState(chatId);
-      if (!state) return;
+      const state = this.ensureState(chatId);
+      if (state.finalized || event.sequence <= state.lastSequence) return;
+      state.lastSequence = event.sequence;
 
-      state.pendingText = fullText;
-      if (state.thinking && fullText.trim()) state.thinking = false;
-
-      if (state.segmentClosed) {
-        await this.openContentSegment(state);
+      switch (event.type) {
+        case 'text':
+          await this.acceptText(state, event.fullText);
+          break;
+        case 'tool_start':
+          await this.startTool(state, event.toolId, event.toolName, event.toolInput);
+          break;
+        case 'tool_end':
+          await this.endTool(state, event.toolId, event.status);
+          break;
       }
-
-      const currentText = this.currentText(state);
-      if (currentText === state.lastSentText) return;
-
-      const elapsed = this.now() - state.lastContentUpdateAt;
-      if (state.lastContentUpdateAt > 0 && elapsed < this.contentThrottleMs) {
-        this.scheduleContentFlush(state, this.contentThrottleMs - elapsed);
-        return;
-      }
-
-      this.clearContentTimer(state);
-      await this.flushContent(state);
     });
   }
 
-  onTools(chatId: string, tools: ToolCallInfo[]): void {
-    void this.enqueue(chatId, async () => {
-      const state = await this.ensureState(chatId);
-      if (!state) return;
-
-      const knownToolIds = new Set(state.toolCalls.map((tool) => tool.id));
-      const hasNewTool = tools.some(
-        (tool) => tool.status === 'running' && !knownToolIds.has(tool.id),
-      );
-      const hasCurrentText = Boolean(this.currentText(state).trim());
-
-      // A new tool after assistant text is a hard ordering barrier:
-      // content -> old progress finalization -> new progress -> next content.
-      if (hasNewTool && hasCurrentText && !state.segmentClosed) {
-        this.clearContentTimer(state);
-        await this.closeContentSegment(state);
-        await this.finalizeProgress(state);
-        this.resetProgress(state);
-      }
-
-      state.toolCalls = tools.map((tool) => ({ ...tool }));
-      const rendered = this.renderer.progress(state.toolCalls);
-      if (
-        rendered.content === state.lastProgressContent
-        && rendered.lines.join('\n') === state.progressLines.join('\n')
-      ) {
-        return;
-      }
-
-      state.progressLines = rendered.lines;
-      state.lastProgressContent = rendered.content;
-
-      const elapsed = this.now() - state.lastProgressUpdateAt;
-      const needsCreate = !state.progressMessageId;
-      if (!needsCreate && state.lastProgressUpdateAt > 0 && elapsed < this.progressThrottleMs) {
-        this.scheduleProgressFlush(state, this.progressThrottleMs - elapsed);
-        return;
-      }
-
-      this.clearProgressTimer(state);
-      await this.flushProgress(state, false);
-    });
-  }
-
-  /** Flush pending text before a permission card or another ordered message. */
+  /** Flush pending writes before a permission card or another ordered message. */
   flush(chatId: string): Promise<void> {
     return this.enqueue(chatId, async () => {
       const state = this.states.get(chatId);
-      if (!state) return;
+      if (!state || state.finalized) return;
       this.clearContentTimer(state);
-      this.clearProgressTimer(state);
-      await this.flushContent(state);
+      await this.flushText(state);
+      await this.flushToolGroup(state);
     });
   }
 
@@ -194,10 +150,7 @@ export class FeishuStreamCoordinator {
 
   cleanup(chatId: string): void {
     const state = this.states.get(chatId);
-    if (state) {
-      this.clearContentTimer(state);
-      this.clearProgressTimer(state);
-    }
+    if (state) this.clearContentTimer(state);
     this.states.delete(chatId);
   }
 
@@ -214,21 +167,20 @@ export class FeishuStreamCoordinator {
     const state = this.states.get(chatId);
     if (!state) return null;
     return {
-      currentMessageId: state.currentMessageId,
-      contentMessageIds: [...state.contentMessageIds],
-      baseLength: state.baseLength,
-      currentSegmentText: state.currentSegmentText,
-      segmentClosed: state.segmentClosed,
-      progressMessageId: state.progressMessageId,
-      progressMessageIds: [...state.progressMessageIds],
-      contentEditCount: state.contentEditCount,
-      progressEditCount: state.progressEditCount,
+      currentMessageId: state.currentSegment?.messageId ?? null,
+      contentMessageIds: state.textSegments.map((segment) => segment.messageId),
+      toolGroupMessageId: state.currentToolGroup?.messageId ?? null,
+      completedToolGroupMessageIds: [...state.completedToolGroupMessageIds],
+      toolGroupSerial: state.toolGroupSerial,
+      lastSequence: state.lastSequence,
+      finalized: state.finalized,
+      finalMessageId: state.finalMessageId,
     };
   }
 
   private enqueue<T>(chatId: string, operation: () => Promise<T>): Promise<T> {
     const previous = this.writeTails.get(chatId) ?? Promise.resolve();
-    const next = previous.then(() => operation(), () => operation());
+    const next = previous.then(operation, operation);
     this.writeTails.set(chatId, next);
     next.finally(() => {
       if (this.writeTails.get(chatId) === next) this.writeTails.delete(chatId);
@@ -236,208 +188,269 @@ export class FeishuStreamCoordinator {
     return next;
   }
 
-  private async ensureState(chatId: string, replyToMessageId?: string): Promise<StreamState | null> {
+  private ensureState(chatId: string, replyToMessageId?: string): StreamState {
     const existing = this.states.get(chatId);
     if (existing) return existing;
 
-    try {
-      const messageId = await this.transport.createPost(
-        chatId,
-        this.renderer.post('💭 Thinking...'),
-        replyToMessageId,
-      );
-      if (!messageId) return null;
-
-      const state: StreamState = {
-        chatId,
-        replyToMessageId,
-        startTime: this.now(),
-        pendingText: '',
-        baseLength: 0,
-        currentSegmentText: '',
-        segmentClosed: false,
-        thinking: true,
-        currentMessageId: messageId,
-        contentMessageIds: [messageId],
-        contentEditCount: 0,
-        lastContentUpdateAt: 0,
-        lastSentContent: '',
-        lastSentText: '',
-        contentTimer: null,
-        toolCalls: [],
-        progressMessageId: null,
-        progressMessageIds: [],
-        progressLines: [],
-        lastProgressContent: '',
-        lastProgressUpdateAt: 0,
-        progressEditCount: 0,
-        progressTimer: null,
-      };
-      this.states.set(chatId, state);
-      return state;
-    } catch (error) {
-      this.report('stream.create', error);
-      return null;
-    }
+    const state: StreamState = {
+      chatId,
+      replyToMessageId,
+      firstMessagePending: true,
+      startTime: this.now(),
+      pendingText: '',
+      segmentBaseLength: 0,
+      currentSegment: null,
+      textSegments: [],
+      contentTimer: null,
+      currentToolGroup: null,
+      toolGroupSerial: 0,
+      completedToolGroupMessageIds: [],
+      lastSequence: 0,
+      finalMessageId: null,
+      finalized: false,
+    };
+    this.states.set(chatId, state);
+    return state;
   }
 
-  private async openContentSegment(state: StreamState): Promise<void> {
-    if (!state.segmentClosed) return;
-    try {
-      const messageId = await this.transport.createPost(
-        state.chatId,
-        this.renderer.post('💭 Thinking...'),
-        state.replyToMessageId,
-      );
-      if (!messageId) return;
+  private async acceptText(state: StreamState, fullText: string): Promise<void> {
+    const previousText = state.pendingText;
+    state.pendingText = fullText;
 
-      state.currentMessageId = messageId;
-      state.contentMessageIds.push(messageId);
-      state.segmentClosed = false;
-      state.currentSegmentText = '';
-      state.lastSentContent = '';
-      state.lastSentText = '';
-      state.contentEditCount = 0;
-      state.lastContentUpdateAt = 0;
-    } catch (error) {
-      this.report('stream.segment.create', error);
+    const textAfterBoundary = this.currentText(state);
+    const hasVisibleNewText = textAfterBoundary.trim().length > 0
+      && (fullText !== previousText || !state.currentSegment);
+
+    // Text is the boundary that seals the preceding contiguous tool group.
+    // Ignore an empty delimiter so a stray newline cannot split a group.
+    if (state.currentToolGroup && hasVisibleNewText) {
+      await this.closeToolGroup(state);
     }
+
+    if (!textAfterBoundary.trim()) return;
+
+    if (!state.currentSegment) {
+      await this.createTextSegment(state, textAfterBoundary);
+      return;
+    }
+
+    if (textAfterBoundary === state.currentSegment.sentText) return;
+
+    const elapsed = this.now() - state.currentSegment.lastUpdateAt;
+    if (state.currentSegment.lastUpdateAt > 0 && elapsed < this.contentThrottleMs) {
+      this.scheduleContentFlush(state, this.contentThrottleMs - elapsed);
+      return;
+    }
+
+    this.clearContentTimer(state);
+    await this.flushText(state);
   }
 
   private currentText(state: StreamState): string {
-    return state.pendingText.slice(state.baseLength);
+    if (state.pendingText.length < state.segmentBaseLength) return state.pendingText;
+    return state.pendingText.slice(state.segmentBaseLength);
   }
 
-  private async flushContent(state: StreamState): Promise<void> {
-    if (!state.currentMessageId || state.segmentClosed) return;
+  private async createTextSegment(state: StreamState, text: string): Promise<void> {
+    const messageId = await this.createPost(state, this.renderer.post(text));
+    if (!messageId) return;
 
+    const segment: TextSegment = {
+      messageId,
+      baseLength: state.segmentBaseLength,
+      toolGroupSerial: state.toolGroupSerial,
+      sentText: text,
+      sentContent: this.renderer.post(text),
+      editCount: 0,
+      lastUpdateAt: this.now(),
+    };
+    state.currentSegment = segment;
+    state.textSegments.push(segment);
+  }
+
+  private async flushText(state: StreamState): Promise<void> {
     const text = this.currentText(state);
-    // Callers only invoke this after deciding whether throttling applies;
-    // never turn an already-successful update into another identical edit.
-    if (text === state.lastSentText) return;
-    const display = text || '💭 Thinking...';
-    const content = this.renderer.post(display);
-    if (content === state.lastSentContent) return;
+    if (!text.trim()) return;
 
-    if (state.contentEditCount >= this.maxEditsPerMessage) {
-      await this.rolloverContent(state, text);
+    if (!state.currentSegment) {
+      await this.createTextSegment(state, text);
       return;
     }
 
-    const messageId = state.currentMessageId;
-    try {
-      state.contentEditCount++;
-      await this.transport.updatePost(messageId, content);
-      state.lastSentContent = content;
-      state.lastSentText = text;
-      state.currentSegmentText = text;
-      state.lastContentUpdateAt = this.now();
-    } catch (error) {
-      state.contentEditCount = Math.max(0, state.contentEditCount - 1);
-      state.lastContentUpdateAt = 0;
-      this.report('stream.content.update', error);
+    const segment = state.currentSegment;
+    if (text === segment.sentText) return;
 
-      if (this.isEditLimitError(error)) {
-        await this.rolloverContent(state, text);
-      }
+    const content = this.renderer.post(text);
+    if (content === segment.sentContent) return;
+
+    if (segment.editCount >= this.maxEditsPerMessage) {
+      await this.rolloverText(state, text);
+      return;
+    }
+
+    try {
+      segment.editCount++;
+      await this.transport.updatePost(segment.messageId, content);
+      segment.sentText = text;
+      segment.sentContent = content;
+      segment.lastUpdateAt = this.now();
+    } catch (error) {
+      segment.editCount = Math.max(0, segment.editCount - 1);
+      segment.lastUpdateAt = 0;
+      this.report('stream.content.update', error);
+      if (this.isEditLimitError(error)) await this.rolloverText(state, text);
     }
   }
 
-  private async rolloverContent(state: StreamState, text: string): Promise<void> {
-    const previousText = state.lastSentText;
+  private async rolloverText(state: StreamState, text: string): Promise<void> {
+    const previousText = state.currentSegment?.sentText ?? '';
     const tail = previousText && text.startsWith(previousText)
       ? text.slice(previousText.length)
       : text;
+    const messageId = await this.createPost(state, this.renderer.post(tail || '💭 Thinking...'));
+    if (!messageId) return;
 
-    try {
-      const messageId = await this.transport.createPost(
-        state.chatId,
-        this.renderer.post(tail || '💭 Thinking...'),
-        state.replyToMessageId,
-      );
+    const segment: TextSegment = {
+      messageId,
+      baseLength: state.pendingText.length - tail.length,
+      toolGroupSerial: state.toolGroupSerial,
+      sentText: tail,
+      sentContent: this.renderer.post(tail || '💭 Thinking...'),
+      editCount: 0,
+      lastUpdateAt: this.now(),
+    };
+    state.segmentBaseLength = segment.baseLength;
+    state.currentSegment = segment;
+    state.textSegments.push(segment);
+  }
+
+  private async startTool(
+    state: StreamState,
+    toolId: string,
+    toolName: string,
+    toolInput?: string,
+  ): Promise<void> {
+    if (!state.currentToolGroup) {
+      this.clearContentTimer(state);
+      await this.closeTextSegment(state);
+      state.toolGroupSerial++;
+      state.currentToolGroup = {
+        serial: state.toolGroupSerial,
+        messageId: null,
+        tools: [],
+        lastSentContent: '',
+        editCount: 0,
+      };
+    }
+
+    const group = state.currentToolGroup;
+    if (group.tools.some((tool) => tool.id === toolId)) return;
+    group.tools.push({
+      id: toolId,
+      name: toolName,
+      status: 'running',
+      input: toolInput,
+    });
+    await this.flushToolGroup(state);
+  }
+
+  private async endTool(
+    state: StreamState,
+    toolId: string,
+    status: 'complete' | 'error',
+  ): Promise<void> {
+    if (!state.currentToolGroup) {
+      this.clearContentTimer(state);
+      await this.closeTextSegment(state);
+      state.toolGroupSerial++;
+      state.currentToolGroup = {
+        serial: state.toolGroupSerial,
+        messageId: null,
+        tools: [],
+        lastSentContent: '',
+        editCount: 0,
+      };
+    }
+
+    const group = state.currentToolGroup;
+    const existing = group.tools.find((tool) => tool.id === toolId);
+    if (existing) {
+      existing.status = status;
+    } else {
+      group.tools.push({ id: toolId, name: 'tool', status });
+    }
+    await this.flushToolGroup(state);
+  }
+
+  private async closeTextSegment(state: StreamState): Promise<void> {
+    if (state.currentSegment) {
+      await this.flushText(state);
+      // A permission/API barrier may arrive immediately after a throttled
+      // update. Give the same message one forced retry before sealing it.
+      if (state.currentSegment && state.currentSegment.sentText !== this.currentText(state)) {
+        await this.flushText(state);
+      }
+    }
+    state.currentSegment = null;
+    state.segmentBaseLength = state.pendingText.length;
+  }
+
+  private async flushToolGroup(state: StreamState): Promise<void> {
+    const group = state.currentToolGroup;
+    if (!group || group.tools.length === 0) return;
+
+    const content = this.renderer.tools(group.tools);
+    if (content === group.lastSentContent) return;
+
+    if (!group.messageId) {
+      const messageId = await this.createPost(state, content);
       if (!messageId) return;
-
-      state.currentMessageId = messageId;
-      state.contentMessageIds.push(messageId);
-      state.baseLength = state.pendingText.length - tail.length;
-      state.currentSegmentText = tail;
-      state.lastSentText = tail;
-      state.lastSentContent = this.renderer.post(tail || '💭 Thinking...');
-      state.contentEditCount = 0;
-      state.lastContentUpdateAt = this.now();
-      state.segmentClosed = false;
-    } catch (error) {
-      this.report('stream.content.rollover', error);
-    }
-  }
-
-  private async closeContentSegment(state: StreamState): Promise<void> {
-    if (state.segmentClosed) return;
-    await this.flushContent(state);
-    state.segmentClosed = true;
-    state.baseLength = state.pendingText.length;
-    state.lastContentUpdateAt = 0;
-  }
-
-  private async flushProgress(state: StreamState, force: boolean): Promise<void> {
-    if (state.progressLines.length === 0) return;
-    const content = state.lastProgressContent;
-    if (!content) return;
-
-    if (!state.progressMessageId) {
-      try {
-        const messageId = await this.transport.createPost(state.chatId, content);
-        if (messageId) {
-          state.progressMessageId = messageId;
-          state.progressMessageIds.push(messageId);
-          state.lastProgressUpdateAt = this.now();
-          state.progressEditCount = 0;
-        }
-      } catch (error) {
-        this.report('stream.progress.create', error);
-      }
+      group.messageId = messageId;
+      group.lastSentContent = content;
+      group.editCount = 0;
       return;
     }
 
-    if (!force && state.progressEditCount >= this.maxProgressEditsPerMessage) {
-      state.progressMessageId = null;
-      state.progressEditCount = 0;
-      await this.flushProgress(state, true);
+    if (group.editCount >= this.maxToolGroupEditsPerMessage) {
+      await this.rolloverToolGroup(state, content);
       return;
     }
 
-    const messageId = state.progressMessageId;
     try {
-      state.progressEditCount++;
-      await this.transport.updatePost(messageId, content);
-      state.lastProgressUpdateAt = this.now();
+      group.editCount++;
+      await this.transport.updatePost(group.messageId, content);
+      group.lastSentContent = content;
     } catch (error) {
-      state.progressEditCount = Math.max(0, state.progressEditCount - 1);
-      state.lastProgressUpdateAt = 0;
-      this.report('stream.progress.update', error);
-      if (this.isEditLimitError(error)) {
-        state.progressMessageId = null;
-        state.progressEditCount = 0;
-        await this.flushProgress(state, true);
+      group.editCount = Math.max(0, group.editCount - 1);
+      this.report('stream.tool-group.update', error);
+      if (this.isEditLimitError(error)) await this.rolloverToolGroup(state, content);
+    }
+  }
+
+  private async rolloverToolGroup(state: StreamState, content: string): Promise<void> {
+    const group = state.currentToolGroup;
+    if (!group) return;
+    const oldMessageId = group.messageId;
+    const messageId = await this.createPost(state, content);
+    if (!messageId) return;
+    group.messageId = messageId;
+    group.lastSentContent = content;
+    group.editCount = 0;
+    if (oldMessageId) {
+      try {
+        await this.transport.deleteMessage(oldMessageId);
+      } catch (error) {
+        this.report('stream.tool-group.delete-old', error);
       }
     }
   }
 
-  private async finalizeProgress(state: StreamState): Promise<void> {
-    if (!state.progressMessageId || state.progressLines.length === 0) return;
-    const finalized = this.renderer.finalizeProgress(state.lastProgressContent);
-    if (!finalized || finalized === state.lastProgressContent) return;
-    state.lastProgressContent = finalized;
-    await this.flushProgress(state, true);
-  }
-
-  private resetProgress(state: StreamState): void {
-    this.clearProgressTimer(state);
-    state.progressMessageId = null;
-    state.progressLines = [];
-    state.lastProgressContent = '';
-    state.lastProgressUpdateAt = 0;
-    state.progressEditCount = 0;
+  private async closeToolGroup(state: StreamState): Promise<void> {
+    const group = state.currentToolGroup;
+    if (!group) return;
+    await this.flushToolGroup(state);
+    if (group.messageId) state.completedToolGroupMessageIds.push(group.messageId);
+    state.currentToolGroup = null;
   }
 
   private async finalize(
@@ -447,110 +460,100 @@ export class FeishuStreamCoordinator {
   ): Promise<boolean> {
     const state = this.states.get(chatId);
     if (!state) return false;
+    if (state.finalized) return state.finalMessageId !== null;
 
     this.clearContentTimer(state);
-    this.clearProgressTimer(state);
+    if (responseText.length > state.pendingText.length) state.pendingText = responseText;
 
-    if (responseText.length > state.pendingText.length) {
-      state.pendingText = responseText;
+    await this.flushText(state);
+    if (state.currentToolGroup && status === 'interrupted') {
+      for (const tool of state.currentToolGroup.tools) {
+        if (tool.status === 'running') tool.status = 'error';
+      }
     }
-    if (!state.segmentClosed) {
-      await this.flushContent(state);
-    } else if (state.pendingText.length > state.baseLength) {
-      await this.openContentSegment(state);
-      await this.flushContent(state);
-    }
-    await this.finalizeProgress(state);
+    await this.flushToolGroup(state);
+    await this.closeToolGroup(state);
 
     const statusLabels: Record<FeishuStreamStatus, string> = {
       completed: '✅ Completed',
       interrupted: '⚠️ Interrupted',
       error: '❌ Error',
     };
-    const elapsed = this.formatElapsed(this.now() - state.startTime);
     const finalStatus = statusLabels[status];
-    const currentText = state.currentSegmentText || this.currentText(state);
-    const finalContent = this.renderer.post(
-      `${currentText || '💭 Thinking...'}\n\n${finalStatus} · ${elapsed}`,
-    );
+    const elapsed = this.formatElapsed(this.now() - state.startTime);
+    const currentText = state.currentSegment?.sentText || this.currentText(state);
+    const finalText = state.toolGroupSerial > 0
+      ? (currentText || responseText || '💭 Thinking...')
+      : (responseText || currentText || '💭 Thinking...');
+    const footer = { status: finalStatus, elapsed };
 
-    // Complex answers get one clean final card. This also removes all
-    // fragmented preview messages, so the final answer cannot be duplicated.
-    if (this.renderer.hasComplexMarkdown(responseText)) {
-      const delivered = await this.sendFinalReplacement(
+    // The mutable preview for the final text is only a staging message. Keep
+    // earlier text/tool groups, remove the final staging segment, then create
+    // a dedicated final message so it is physically last in Feishu.
+    await this.removeFinalPreviewSegments(state);
+
+    let delivered = false;
+    if (this.renderer.hasComplexMarkdown(finalText)) {
+      delivered = await this.tryCreateFinal(
         state,
-        () => this.transport.createInteractive(
-          chatId,
-          this.renderer.finalCard(responseText, state.toolCalls, {
-            status: finalStatus,
-            elapsed,
-          }),
-        ),
+        () => this.transport.createInteractive(chatId, this.renderer.finalCard(finalText, footer)),
         'stream.final.card',
       );
-      if (delivered) return true;
     }
-
-    // Once tool progress exists, the current content message physically sits
-    // before that progress bubble. Send the final plain answer after progress
-    // and remove fragmented previews so the final answer is always last.
-    if (state.progressMessageIds.length > 0 || state.contentMessageIds.length > 1) {
-      const delivered = await this.sendFinalReplacement(
+    if (!delivered) {
+      delivered = await this.tryCreateFinal(
         state,
-        () => this.transport.createPost(chatId, this.renderer.post(
-          `${responseText || currentText || '💭 Thinking...'}\n\n${finalStatus} · ${elapsed}`,
-        )),
-        'stream.final.ordered',
+        () => this.createPost(state, this.renderer.post(`${finalText}\n\n${finalStatus} · ${elapsed}`)),
+        'stream.final.post',
       );
-      if (delivered) return true;
     }
 
-    if (state.currentMessageId && !state.segmentClosed) {
-      try {
-        if (state.contentEditCount >= this.maxEditsPerMessage) {
-          throw new Error('stream final update reached edit budget');
-        }
-        state.contentEditCount++;
-        await this.transport.updatePost(state.currentMessageId, finalContent);
-        state.lastSentContent = finalContent;
-        state.lastSentText = currentText;
-        state.currentSegmentText = currentText;
-        return true;
-      } catch (error) {
-        state.contentEditCount = Math.max(0, state.contentEditCount - 1);
-        this.report('stream.final.update', error);
-      }
-    }
-
-    // Final fallback is intentionally a post, even for complex Markdown. It
-    // guarantees that bridge-manager does not send a second full answer.
-    const fallback = await this.sendFinalReplacement(
-      state,
-      () => this.transport.createPost(chatId, this.renderer.post(
-        `${responseText || currentText || '💭 Thinking...'}\n\n${finalStatus} · ${elapsed}`,
-      )),
-      'stream.final.fallback',
-    );
-    return fallback;
+    state.finalized = delivered;
+    return delivered;
   }
 
-  private async sendFinalReplacement(
+  private async removeFinalPreviewSegments(state: StreamState): Promise<void> {
+    const finalSerial = state.toolGroupSerial;
+    const candidates = finalSerial === 0
+      ? state.textSegments
+      : state.currentSegment?.sentText.trim()
+        ? state.textSegments.filter((segment) => segment.toolGroupSerial === finalSerial)
+        : [];
+
+    for (const segment of candidates) {
+      try {
+        await this.transport.deleteMessage(segment.messageId);
+      } catch (error) {
+        this.report('stream.final.preview-delete', error);
+      }
+    }
+  }
+
+  private async tryCreateFinal(
     state: StreamState,
-    send: () => Promise<string | null>,
+    create: () => Promise<string | null>,
     scope: string,
   ): Promise<boolean> {
     try {
-      const messageId = await send();
+      const messageId = await create();
       if (!messageId) return false;
-      await Promise.allSettled(
-        state.contentMessageIds
-          .filter((id) => id !== messageId)
-          .map((id) => this.transport.deleteMessage(id)),
-      );
+      state.finalMessageId = messageId;
       return true;
     } catch (error) {
       this.report(scope, error);
       return false;
+    }
+  }
+
+  private async createPost(state: StreamState, content: string): Promise<string | null> {
+    try {
+      const replyToMessageId = state.firstMessagePending ? state.replyToMessageId : undefined;
+      const messageId = await this.transport.createPost(state.chatId, content, replyToMessageId);
+      if (messageId) state.firstMessagePending = false;
+      return messageId;
+    } catch (error) {
+      this.report('stream.post.create', error);
+      return null;
     }
   }
 
@@ -560,20 +563,8 @@ export class FeishuStreamCoordinator {
       state.contentTimer = null;
       void this.enqueue(state.chatId, async () => {
         const current = this.states.get(state.chatId);
-        if (current !== state || state.segmentClosed) return;
-        await this.flushContent(state);
-      });
-    }, Math.max(0, delay));
-  }
-
-  private scheduleProgressFlush(state: StreamState, delay: number): void {
-    if (state.progressTimer) return;
-    state.progressTimer = setTimeout(() => {
-      state.progressTimer = null;
-      void this.enqueue(state.chatId, async () => {
-        const current = this.states.get(state.chatId);
-        if (current !== state) return;
-        await this.flushProgress(state, true);
+        if (current !== state || state.finalized) return;
+        await this.flushText(state);
       });
     }, Math.max(0, delay));
   }
@@ -582,12 +573,6 @@ export class FeishuStreamCoordinator {
     if (!state.contentTimer) return;
     clearTimeout(state.contentTimer);
     state.contentTimer = null;
-  }
-
-  private clearProgressTimer(state: StreamState): void {
-    if (!state.progressTimer) return;
-    clearTimeout(state.progressTimer);
-    state.progressTimer = null;
   }
 
   private isEditLimitError(error: unknown): boolean {

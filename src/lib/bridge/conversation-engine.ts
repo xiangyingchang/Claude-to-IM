@@ -8,7 +8,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { ChannelBinding } from './types.js';
+import type { ChannelBinding, StreamEvent } from './types.js';
 import type {
   FileAttachment,
   SSEEvent,
@@ -47,6 +47,12 @@ export type OnPartialText = (fullText: string) => void;
 export type OnToolEvent = (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', toolInput?: string) => void;
 
 /**
+ * Callback invoked for each ordered stream event. Unlike the legacy callbacks
+ * this preserves the exact text/tool boundary sequence for message timelines.
+ */
+export type OnStreamEvent = (event: StreamEvent) => void;
+
+/**
  * @deprecated Use buildToolPreview / buildToolDisplayLine from './tool-display.js'.
  * Build a short human-readable summary of a tool input for execution records.
  */
@@ -77,6 +83,7 @@ export async function processMessage(
   files?: FileAttachment[],
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  onStreamEvent?: OnStreamEvent,
 ): Promise<ConversationResult> {
   const { store, llm } = getBridgeContext();
   const sessionId = binding.codepilotSessionId;
@@ -193,7 +200,7 @@ export async function processMessage(
     // Consume the stream server-side (replicate collectStreamResponse pattern).
     // Permission requests are forwarded immediately via the callback during streaming
     // because the stream blocks until permission is resolved — we can't wait until after.
-    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent);
+    return await consumeStream(stream, sessionId, onPermissionRequest, onPartialText, onToolEvent, onStreamEvent);
   } finally {
     clearInterval(renewalInterval);
     store.releaseSessionLock(sessionId, lockId);
@@ -211,6 +218,7 @@ async function consumeStream(
   onPermissionRequest?: OnPermissionRequest,
   onPartialText?: OnPartialText,
   onToolEvent?: OnToolEvent,
+  onStreamEvent?: OnStreamEvent,
 ): Promise<ConversationResult> {
   const { store } = getBridgeContext();
   const reader = stream.getReader();
@@ -218,6 +226,8 @@ async function consumeStream(
   let currentText = '';
   /** Monotonically accumulated text for streaming preview — never resets on tool_use. */
   let previewText = '';
+  /** Sequence shared by text/tool events so message adapters can preserve order. */
+  let streamSequence = 0;
   let tokenUsage: TokenUsage | null = null;
   let hasError = false;
   let errorMessage = '';
@@ -244,9 +254,15 @@ async function consumeStream(
         switch (event.type) {
           case 'text':
             currentText += event.data;
+            previewText += event.data;
+            const textSequence = ++streamSequence;
             if (onPartialText) {
-              previewText += event.data;
               try { onPartialText(previewText); } catch { /* non-critical */ }
+            }
+            if (onStreamEvent) {
+              try {
+                onStreamEvent({ type: 'text', fullText: previewText, sequence: textSequence });
+              } catch { /* non-critical */ }
             }
             break;
 
@@ -265,6 +281,17 @@ async function consumeStream(
               });
               if (onToolEvent) {
                 try { onToolEvent(toolData.id, toolData.name, 'running', buildToolPreview(toolData.name, toolData.input)); } catch { /* non-critical */ }
+              }
+              if (onStreamEvent) {
+                try {
+                  onStreamEvent({
+                    type: 'tool_start',
+                    toolId: toolData.id,
+                    toolName: toolData.name,
+                    toolInput: buildToolPreview(toolData.name, toolData.input) || undefined,
+                    sequence: ++streamSequence,
+                  });
+                } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
             break;
@@ -295,6 +322,16 @@ async function consumeStream(
                     '', // name not available in tool_result, adapter tracks by id
                     resultData.is_error ? 'error' : 'complete',
                   );
+                } catch { /* non-critical */ }
+              }
+              if (onStreamEvent) {
+                try {
+                  onStreamEvent({
+                    type: 'tool_end',
+                    toolId: resultData.tool_use_id,
+                    status: resultData.is_error ? 'error' : 'complete',
+                    sequence: ++streamSequence,
+                  });
                 } catch { /* non-critical */ }
               }
             } catch { /* skip */ }
