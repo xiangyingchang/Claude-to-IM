@@ -62,7 +62,7 @@ function createHarness(
 
   const renderer: FeishuStreamRenderer = {
     post: (text: string) => `post:${text}`,
-    tools: (tools: ToolCallInfo[]) => `tools:${tools.map((tool) => `${tool.status}:${tool.id}`).join('|')}`,
+    tools: (tools: ToolCallInfo[]) => `tools:${tools.map((tool) => `${tool.status}:${tool.id}${tool.input ? `:${tool.input}` : ''}`).join('|')}`,
     finalCard: (text: string, footer: { status: string; elapsed: string }) => `card:${text}|${footer.status}|${footer.elapsed}`,
     hasComplexMarkdown: (text: string) => text.includes('```'),
   };
@@ -92,6 +92,10 @@ function toolEnd(sequence: number, toolId: string, status: 'complete' | 'error' 
   return { type: 'tool_end', toolId, status, sequence };
 }
 
+function toolStartWithoutInput(sequence: number, toolId: string, toolName = 'Edit'): StreamEvent {
+  return { type: 'tool_start', toolId, toolName, sequence };
+}
+
 describe('FeishuStreamCoordinator', () => {
   it('groups consecutive tools into one message between text messages', async () => {
     const { coordinator, operations } = createHarness();
@@ -110,11 +114,11 @@ describe('FeishuStreamCoordinator', () => {
     const creates = operations.filter((operation) => operation.type === 'create');
     const groupCreates = creates.filter((operation) => operation.content?.startsWith('tools:'));
     assert.equal(groupCreates.length, 1, 'two tools in one contiguous phase must create one group message');
-    assert.equal(groupCreates[0]?.content, 'tools:running:1');
+    assert.equal(groupCreates[0]?.content, 'tools:running:1:echo 1');
 
     const groupId = groupCreates[0]?.id;
     assert.ok(groupId);
-    assert.ok(operations.some((operation) => operation.type === 'update' && operation.id === groupId && operation.content === 'tools:complete:1|complete:2'));
+    assert.ok(operations.some((operation) => operation.type === 'update' && operation.id === groupId && operation.content === 'tools:complete:1:echo 1|complete:2:echo 2'));
 
     const finalIndex = operations.findIndex((operation) => operation.type === 'create' && operation.content === 'post:BC');
     const groupLastIndex = operations.reduce((last, operation, index) => operation.id === groupId ? index : last, -1);
@@ -147,6 +151,29 @@ describe('FeishuStreamCoordinator', () => {
     const group2Index = operations.indexOf(groups[1]!);
     assert.ok(group1Index < group2Index);
     assert.equal(operations.filter((operation) => operation.type === 'create' && operation.content?.startsWith('post:before')).length, 1);
+  });
+
+  it('merges late tool arguments into the existing row instead of dropping the preview', async () => {
+    const { coordinator, operations } = createHarness();
+
+    coordinator.start('chat-1');
+    emit(coordinator, toolStartWithoutInput(1, 'edit-1'));
+    emit(coordinator, {
+      type: 'tool_start',
+      toolId: 'edit-1',
+      toolName: 'Edit',
+      toolInput: 'src/app.ts',
+      sequence: 2,
+    });
+    emit(coordinator, toolEnd(3, 'edit-1'));
+    await coordinator.end('chat-1', 'completed', 'done');
+
+    const groups = operations.filter((operation) => operation.type === 'create' && operation.content?.startsWith('tools:'));
+    assert.equal(groups.length, 1);
+    const groupId = groups[0]?.id;
+    assert.ok(groupId);
+    assert.ok(operations.some((operation) => operation.type === 'update' && operation.id === groupId && operation.content === 'tools:running:edit-1:src/app.ts'));
+    assert.ok(operations.some((operation) => operation.type === 'update' && operation.id === groupId && operation.content === 'tools:complete:edit-1:src/app.ts'));
   });
 
   it('serializes all network writes for a chat', async () => {
@@ -227,6 +254,6 @@ describe('FeishuStreamCoordinator', () => {
 
     const groups = operations.filter((operation) => operation.type === 'create' && operation.content?.startsWith('tools:'));
     assert.equal(groups.length, 1);
-    assert.equal(groups[0]?.content, 'tools:running:1');
+    assert.equal(groups[0]?.content, 'tools:running:1:echo 1');
   });
 });

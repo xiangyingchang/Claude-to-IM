@@ -353,7 +353,24 @@ export class FeishuStreamCoordinator {
     }
 
     const group = state.currentToolGroup;
-    if (group.tools.some((tool) => tool.id === toolId)) return;
+    const existing = group.tools.find((tool) => tool.id === toolId);
+    if (existing) {
+      // Codex emits a lightweight tool_use at content_block_start and the
+      // complete arguments again in the assistant block. Keep one visible
+      // row, but merge the later name/input so file paths and commands are not
+      // lost after the first `{}` event.
+      let changed = false;
+      if (toolName && (!existing.name || existing.name === 'tool') && existing.name !== toolName) {
+        existing.name = toolName;
+        changed = true;
+      }
+      if (toolInput && existing.input !== toolInput) {
+        existing.input = toolInput;
+        changed = true;
+      }
+      if (changed) await this.flushToolGroup(state);
+      return;
+    }
     group.tools.push({
       id: toolId,
       name: toolName,

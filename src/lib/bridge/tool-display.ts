@@ -62,20 +62,44 @@ export function lookupToolDisplay(name: string): { emoji: string; verb: string }
 export function buildToolPreview(name: string, input: unknown): string {
   try {
     if (input == null) return '';
-    if (typeof input === 'string') {
+    const lower = name.toLowerCase();
+
+    // Codex can emit the same tool twice: content_block_start carries `{}`
+    // while the later assistant block carries the real arguments. It can also
+    // serialize arguments as a JSON string. Normalize that shape before
+    // looking for file paths or commands.
+    let normalizedInput: unknown = input;
+    if (typeof normalizedInput === 'string') {
+      const raw = normalizedInput.trim();
+      if ((raw.startsWith('{') && raw.endsWith('}')) || (raw.startsWith('[') && raw.endsWith(']'))) {
+        try { normalizedInput = JSON.parse(raw); } catch { /* keep raw text */ }
+      }
+    }
+
+    // ApplyPatch-style tools often expose only a unified patch string. Extract
+    // the affected file names instead of showing an empty pencil line or the
+    // entire patch body.
+    if (isPatchTool(lower)) {
+      const patchText = typeof normalizedInput === 'string'
+        ? normalizedInput
+        : getString(normalizedInput, ['patch', 'diff', 'unified_diff', 'changes']);
+      const patchFiles = extractPatchFiles(patchText);
+      if (patchFiles) return patchFiles;
+    }
+
+    if (typeof normalizedInput === 'string') {
       // Sanitize: strip backticks (would break Feishu inline-code fences)
       // and collapse newlines to keep the bubble single-line.
-      return input.replace(/`/g, "'").replace(/\n/g, ' ').trim().slice(0, 120);
+      return sanitizePreview(normalizedInput);
     }
-    const obj = input as Record<string, unknown>;
-    if (typeof obj !== 'object' || Array.isArray(obj)) {
-      return String(input).replace(/`/g, "'").replace(/\n/g, ' ').trim().slice(0, 120);
+    const obj = unwrapInput(normalizedInput);
+    if (!obj) {
+      return sanitizePreview(String(normalizedInput));
     }
-    const lower = name.toLowerCase();
 
     // Read: "file.ts L218-247" (basename + line range from offset/limit)
     if (lower === 'read' || lower === 'view') {
-      const p = String(obj.path ?? obj.file_path ?? obj.filePath ?? obj.file ?? '').replace(/\\/g, '/');
+      const p = extractPath(obj);
       const base = p.split('/').pop() || p;
       const offset = typeof obj.offset === 'number' ? obj.offset : 0;
       const limit = typeof obj.limit === 'number' ? obj.limit : 0;
@@ -94,9 +118,13 @@ export function buildToolPreview(name: string, input: unknown): string {
     }
 
     // Edit/Write: file path
-    if (lower === 'edit' || lower === 'write' || lower === 'file_write' || lower === 'multi_edit' || lower.includes('edit')) {
-      const p = String(obj.file_path ?? obj.filePath ?? obj.path ?? obj.file ?? '').replace(/\\/g, '/');
+    if (isEditTool(lower)) {
+      const p = extractPath(obj);
       if (p) return p.split('/').pop() || p.slice(0, 120);
+      const fileCount = Array.isArray(obj.files) ? obj.files.length : 0;
+      if (fileCount > 0) return `${fileCount} files`;
+      const content = getString(obj, ['content', 'new_string', 'replacement', 'text']);
+      if (content) return `${content.length} chars`;
     }
 
     // Grep: pattern
@@ -130,17 +158,93 @@ export function buildToolPreview(name: string, input: unknown): string {
     }
 
     // Generic: pick the most informative scalar fields
-    const picks = ['command', 'file_path', 'filePath', 'path', 'url', 'query', 'pattern', 'prompt', 'code', 'text', 'goal', 'name'];
+    const picks = ['command', 'file_path', 'filePath', 'path', 'target_file', 'targetFile', 'url', 'query', 'pattern', 'prompt', 'code', 'text', 'goal', 'name'];
     for (const k of picks) {
       const v = obj[k];
       if (v != null && typeof v === 'string' && v.trim()) {
-        return String(v).replace(/\n/g, ' ').slice(0, 120);
+        return sanitizePreview(String(v));
       }
     }
     return '';
   } catch {
     return '';
   }
+}
+
+function sanitizePreview(value: string): string {
+  return value.replace(/`/g, "'").replace(/\n/g, ' ').trim().slice(0, 120);
+}
+
+function unwrapInput(input: unknown): Record<string, unknown> | null {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const obj = input as Record<string, unknown>;
+  for (const key of ['input', 'arguments', 'args']) {
+    const nested = obj[key];
+    if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+      return nested as Record<string, unknown>;
+    }
+  }
+  return obj;
+}
+
+function getString(input: unknown, keys: string[]): string {
+  const obj = unwrapInput(input);
+  if (!obj) return '';
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  return '';
+}
+
+function extractPath(obj: Record<string, unknown>): string {
+  const keys = ['file_path', 'filePath', 'path', 'file', 'filename', 'target_file', 'targetFile'];
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.trim()) return value.replace(/\\/g, '/');
+  }
+  if (Array.isArray(obj.files)) {
+    const paths = obj.files
+      .map((file) => unwrapInput(file))
+      .map((file) => file ? extractPath(file) : '')
+      .filter(Boolean);
+    if (paths.length > 0) return paths.join(', ');
+  }
+  return '';
+}
+
+function isEditTool(lowerName: string): boolean {
+  return lowerName === 'edit'
+    || lowerName === 'write'
+    || lowerName === 'file_write'
+    || lowerName === 'multi_edit'
+    || lowerName.includes('edit')
+    || lowerName.includes('write')
+    || isPatchTool(lowerName);
+}
+
+function isPatchTool(lowerName: string): boolean {
+  return lowerName === 'applypatch'
+    || lowerName === 'apply_patch'
+    || lowerName.includes('apply_patch')
+    || lowerName.includes('patch');
+}
+
+function extractPatchFiles(patch: string): string {
+  if (!patch) return '';
+  const files: string[] = [];
+  const add = (value: string) => {
+    const normalized = value.trim().replace(/^a\//, '').replace(/^b\//, '');
+    if (normalized && normalized !== '/dev/null' && !files.includes(normalized)) files.push(normalized);
+  };
+
+  for (const match of patch.matchAll(/^\s*\*\*\*\s+(?:Update|Add|Delete) File:\s*(.+?)\s*$/gm)) {
+    add(match[1]);
+  }
+  for (const match of patch.matchAll(/^\s*\+\+\+\s+(.+?)\s*$/gm)) {
+    add(match[1].split('\t')[0]);
+  }
+  return files.map((file) => file.split('/').pop() || file).join(', ').slice(0, 120);
 }
 
 /**
