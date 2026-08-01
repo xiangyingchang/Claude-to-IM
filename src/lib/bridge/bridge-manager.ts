@@ -689,8 +689,8 @@ async function handleMessage(
     flushPreview(adapter, ps, cfg);
   } : undefined;
 
-  // ── Streaming card setup (Feishu CardKit v2) ──────────────────
-  // If the adapter supports streaming cards (e.g. Feishu), wire up
+  // ── Streaming preview setup ───────────────────────────────────
+  // If the adapter supports a streaming preview (e.g. Feishu), wire up
   // onStreamText, onToolEvent, and onStreamEnd callbacks.
   // These run in parallel with the existing preview system — Feishu
   // uses cards instead of message edit for streaming.
