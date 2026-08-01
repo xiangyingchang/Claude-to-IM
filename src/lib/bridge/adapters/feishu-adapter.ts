@@ -50,6 +50,9 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 
+/** Never let one Feishu HTTP write hold the stream queue indefinitely. */
+const STREAM_API_TIMEOUT_MS = 12_000;
+
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
   sender: {
@@ -363,15 +366,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
   ): Promise<string | null> {
     if (!this.restClient) throw new Error('Feishu client not initialized');
 
-    const response: any = replyToMessageId
-      ? await this.restClient.im.message.reply({
+    const response: any = await this.withStreamTimeout(
+      replyToMessageId
+      ? this.restClient.im.message.reply({
         path: { message_id: replyToMessageId },
         data: { content, msg_type: 'post' },
       })
-      : await this.restClient.im.message.create({
+      : this.restClient.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: { receive_id: chatId, msg_type: 'post', content },
-      });
+      }),
+      'streaming post create',
+    );
 
     this.throwForFeishuResponse(response, 'streaming post create');
     const messageId = response?.data?.message_id;
@@ -382,29 +388,56 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private async updateStreamingPost(messageId: string, content: string): Promise<void> {
     if (!this.restClient) throw new Error('Feishu client not initialized');
-    const response: any = await this.restClient.im.message.update({
-      path: { message_id: messageId },
-      data: { msg_type: 'post', content },
-    });
+    const response: any = await this.withStreamTimeout(
+      this.restClient.im.message.update({
+        path: { message_id: messageId },
+        data: { msg_type: 'post', content },
+      }),
+      'streaming post update',
+    );
     this.throwForFeishuResponse(response, 'streaming post update');
   }
 
   private async createStreamingInteractive(chatId: string, content: string): Promise<string | null> {
     if (!this.restClient) throw new Error('Feishu client not initialized');
-    const response: any = await this.restClient.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'interactive', content },
-    });
+    const response: any = await this.withStreamTimeout(
+      this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'interactive', content },
+      }),
+      'streaming final card create',
+    );
     this.throwForFeishuResponse(response, 'streaming final card create');
     return response?.data?.message_id || null;
   }
 
   private async deleteStreamingMessage(messageId: string): Promise<void> {
     if (!this.restClient) return;
-    const response: any = await this.restClient.im.message.delete({
-      path: { message_id: messageId },
-    });
+    const response: any = await this.withStreamTimeout(
+      this.restClient.im.message.delete({
+        path: { message_id: messageId },
+      }),
+      'streaming preview delete',
+    );
     this.throwForFeishuResponse(response, 'streaming preview delete');
+  }
+
+  private withStreamTimeout<T>(promise: Promise<T>, operation: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        const error = new Error(`${operation} timed out after ${STREAM_API_TIMEOUT_MS}ms`);
+        console.warn('[feishu-adapter]', error.message);
+        reject(error);
+      }, STREAM_API_TIMEOUT_MS);
+
+      promise.then((value) => {
+        clearTimeout(timer);
+        resolve(value);
+      }, (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+    });
   }
 
   private throwForFeishuResponse(response: any, operation: string): void {
