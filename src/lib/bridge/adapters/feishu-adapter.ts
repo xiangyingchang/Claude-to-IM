@@ -49,9 +49,8 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 
-/** State for an active CardKit v2 streaming card. */
+/** State for an active streaming message (post-based progressive edit). */
 interface FeishuCardState {
-  cardId: string;
   messageId: string;
   sequence: number;
   startTime: number;
@@ -60,10 +59,19 @@ interface FeishuCardState {
   pendingText: string | null;
   lastUpdateAt: number;
   throttleTimer: ReturnType<typeof setTimeout> | null;
+  /** Progressive edit counter — Feishu caps edits per message at 20. */
+  editCount: number;
+  /** Length of text already shown in prior segment(s); new segment shows only the delta. */
+  baseLength: number;
 }
 
-/** Streaming card throttle interval (ms). */
+/** Streaming update throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
+
+/** Max progressive edits per message before we start a fresh message.
+ *  Feishu's edit-message API allows at most 20 edits per message; we stay
+ *  well under with room for the finalize edit. */
+const MAX_EDITS_PER_MESSAGE = 15;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -352,11 +360,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  // ── Streaming Card (CardKit v2) ────────────────────────────────
+  // ── Streaming (progressive post-message edit) ─────────────────
 
   /**
-   * Create a new streaming card and send it as a message.
-   * Returns true if card was created successfully.
+   * Create a new streaming message and send it as a post.
+   * Returns true if created successfully.
    */
   private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
     if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
@@ -375,62 +383,33 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!this.restClient) return false;
 
     try {
-      // Step 1: Create card via CardKit v2
-      const cardBody = {
-        schema: '2.0',
-        config: {
-          streaming_mode: true,
-          wide_screen_mode: true,
-          summary: { content: '思考中...' },
-        },
-        body: {
-          elements: [{
-            tag: 'markdown',
-            content: '💭 Thinking...',
-            text_align: 'left',
-            text_size: 'normal',
-            element_id: 'streaming_content',
-          }],
-        },
-      };
+      const content = buildPostContent('💭 Thinking...');
 
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
-        data: { type: 'card_json', data: JSON.stringify(cardBody) },
-      });
-      const cardId = createResp?.data?.card_id;
-      if (!cardId) {
-        console.warn('[feishu-adapter] Card create returned no card_id');
-        return false;
-      }
-
-      // Step 2: Send card as IM message
-      const cardContent = JSON.stringify({ type: 'card', data: { card_id: cardId } });
       let msgResp;
       if (replyToMessageId) {
         msgResp = await this.restClient.im.message.reply({
           path: { message_id: replyToMessageId },
-          data: { content: cardContent, msg_type: 'interactive' },
+          data: { content, msg_type: 'post' },
         });
       } else {
         msgResp = await this.restClient.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
             receive_id: chatId,
-            msg_type: 'interactive',
-            content: cardContent,
+            msg_type: 'post',
+            content,
           },
         });
       }
 
       const messageId = msgResp?.data?.message_id;
       if (!messageId) {
-        console.warn('[feishu-adapter] Card message send returned no message_id');
+        console.warn('[feishu-adapter] Streaming message send returned no message_id');
         return false;
       }
 
-      // Store card state
+      // Store streaming state
       this.activeCards.set(chatId, {
-        cardId,
         messageId,
         sequence: 0,
         startTime: Date.now(),
@@ -439,12 +418,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
         pendingText: null,
         lastUpdateAt: 0,
         throttleTimer: null,
+        editCount: 0,
+        baseLength: 0,
       });
 
-      console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
+      console.log(`[feishu-adapter] Streaming message created: msgId=${messageId}`);
       return true;
     } catch (err) {
-      console.warn('[feishu-adapter] Failed to create streaming card:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] Failed to create streaming message:', err instanceof Error ? err.message : err);
       return false;
     }
   }
@@ -483,26 +464,52 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Flush pending card update to Feishu API.
+   * Flush pending streaming update to Feishu API via message update (PUT).
    */
   private flushCardUpdate(chatId: string): void {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
 
-    const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
+    // Feishu caps edits per message at 20. When we approach the cap, finalize
+    // the current message and start a fresh one for continued streaming.
+    if (state.editCount >= MAX_EDITS_PER_MESSAGE) {
+      const fullText = state.pendingText || '';
+      // Finalize current message (quietly — no status footer, just current text)
+      this.restClient.im.message.update({
+        path: { message_id: state.messageId },
+        data: { msg_type: 'post', content: buildPostContent(fullText || '💭 Thinking...') },
+      }).catch((err: unknown) => {
+        console.warn('[feishu-adapter] segment-finalize update failed:', err instanceof Error ? err.message : err);
+      });
+      this.activeCards.delete(chatId);
+      // Start a fresh message; new segment shows only the delta.
+      const replyTo = this.lastIncomingMessageId.get(chatId);
+      this.createStreamingCard(chatId, replyTo).then((ok) => {
+        if (!ok) return;
+        const st = this.activeCards.get(chatId);
+        if (st) st.baseLength = fullText.length;
+        // Re-queue current text so the next delta continues into the new message.
+        this.updateCardContent(chatId, fullText);
+      }).catch(() => {});
+      return;
+    }
+
+    // Show only the delta since the last segment (baseLength).
+    const shown = (state.pendingText || '').slice(state.baseLength);
+    const content = buildStreamingContent(shown, state.toolCalls);
 
     state.sequence++;
-    const seq = state.sequence;
-    const cardId = state.cardId;
+    const messageId = state.messageId;
 
     // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
-      data: { content, sequence: seq },
+    this.restClient.im.message.update({
+      path: { message_id: messageId },
+      data: { msg_type: 'post', content: buildPostContent(content) },
     }).then(() => {
       state.lastUpdateAt = Date.now();
+      state.editCount++;
     }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] message.update failed:', err instanceof Error ? err.message : err);
     });
   }
 
@@ -518,7 +525,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Finalize the streaming card: close streaming mode, update with final content + footer.
+   * Finalize the streaming message: edit with final content + footer.
+   * For complex markdown (code blocks/tables) which message.update cannot
+   * render, send an interactive card and retract the preview message.
    */
   private async finalizeCard(
     chatId: string,
@@ -541,37 +550,59 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     try {
-      // Step 1: Close streaming mode
-      state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
-        path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
-      });
-
-      // Step 2: Build and apply final card
       const statusLabels: Record<string, string> = {
         completed: '✅ Completed',
         interrupted: '⚠️ Interrupted',
         error: '❌ Error',
       };
       const elapsedMs = Date.now() - state.startTime;
-      const footer = {
-        status: statusLabels[status] || status,
-        elapsed: formatElapsed(elapsedMs),
-      };
+      const statusLabel = statusLabels[status] || status;
+      const elapsedLabel = formatElapsed(elapsedMs);
 
-      const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
+      // Complex markdown (code blocks/tables) cannot be edited in place via
+      // message.update (only text/post supported). Send as an interactive card
+      // and retract the streaming preview so the user sees one clean result.
+      if (hasComplexMarkdown(responseText)) {
+        const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, {
+          status: statusLabel,
+          elapsed: elapsedLabel,
+        });
+        try {
+          const cardRes = await this.restClient.im.message.create({
+            params: { receive_id_type: 'chat_id' },
+            data: {
+              receive_id: chatId,
+              msg_type: 'interactive',
+              content: finalCardJson,
+            },
+          });
+          if (cardRes?.data?.message_id) {
+            // Retract the streaming preview message (best effort).
+            await this.restClient.im.message.delete({
+              path: { message_id: state.messageId },
+            }).catch(() => {});
+            console.log(`[feishu-adapter] Final card sent (complex md), preview retracted: status=${status}, elapsed=${elapsedLabel}`);
+            return true;
+          }
+          console.warn('[feishu-adapter] Final card send failed:', cardRes?.msg, cardRes?.code);
+        } catch (err) {
+          console.warn('[feishu-adapter] Final card send error:', err instanceof Error ? err.message : err);
+        }
+        // Fall through to post edit if card path failed.
+      }
 
-      state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
-        path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+      // Simple text — edit the streaming post with final content + footer.
+      const display = buildStreamingContent(responseText, state.toolCalls);
+      const finalContent = `${display}\n\n${statusLabel} · ${elapsedLabel}`;
+      await this.restClient.im.message.update({
+        path: { message_id: state.messageId },
+        data: { msg_type: 'post', content: buildPostContent(finalContent) },
       });
 
-      console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
+      console.log(`[feishu-adapter] Message finalized: msgId=${state.messageId}, status=${status}, elapsed=${elapsedLabel}`);
       return true;
     } catch (err) {
-      console.warn('[feishu-adapter] Card finalize failed:', err instanceof Error ? err.message : err);
+      console.warn('[feishu-adapter] Finalize failed:', err instanceof Error ? err.message : err);
       return false;
     } finally {
       this.activeCards.delete(chatId);
