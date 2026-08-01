@@ -485,7 +485,14 @@ export class FeishuStreamCoordinator {
     const finalText = state.toolGroupSerial > 0
       ? (currentText || responseText || '💭 Thinking...')
       : (responseText || currentText || '💭 Thinking...');
-    const footer = { status: finalStatus, elapsed };
+    // A successful answer is already self-explanatory. Keep diagnostic status
+    // only for interruption/error so the final normal text stays clean.
+    const footer = status === 'completed'
+      ? { status: '', elapsed: '' }
+      : { status: finalStatus, elapsed };
+    const finalSuffix = status === 'completed'
+      ? ''
+      : `\n\n${finalStatus} · ${elapsed}`;
 
     // The mutable preview for the final text is only a staging message. Keep
     // earlier text/tool groups, remove the final staging segment, then create
@@ -503,7 +510,7 @@ export class FeishuStreamCoordinator {
     if (!delivered) {
       delivered = await this.tryCreateFinal(
         state,
-        () => this.createPost(state, this.renderer.post(`${finalText}\n\n${finalStatus} · ${elapsed}`)),
+        () => this.createPost(state, this.renderer.post(`${finalText}${finalSuffix}`)),
         'stream.final.post',
       );
     }

@@ -116,9 +116,10 @@ describe('FeishuStreamCoordinator', () => {
     assert.ok(groupId);
     assert.ok(operations.some((operation) => operation.type === 'update' && operation.id === groupId && operation.content === 'tools:complete:1|complete:2'));
 
-    const finalIndex = operations.findIndex((operation) => operation.type === 'create' && operation.content?.startsWith('post:BC\n\n'));
+    const finalIndex = operations.findIndex((operation) => operation.type === 'create' && operation.content === 'post:BC');
     const groupLastIndex = operations.reduce((last, operation, index) => operation.id === groupId ? index : last, -1);
     assert.ok(groupLastIndex >= 0 && groupLastIndex < finalIndex, 'final message must be created after the tool group');
+    assert.equal(operations[finalIndex]?.content?.includes('Completed'), false);
 
     // The staging text after the last tool is removed; the execution group is kept.
     assert.ok(operations.some((operation) => operation.type === 'delete' && operation.id !== groupId));
