@@ -20,6 +20,7 @@ const TOOL_DISPLAY: Record<string, { emoji: string; verb: string }> = {
   Edit: { emoji: '✏️', verb: 'Editing' },
   MultiEdit: { emoji: '✏️', verb: 'Editing' },
   Bash: { emoji: '💻', verb: 'Running' },
+  Run: { emoji: '💻', verb: 'Running' },
   Grep: { emoji: '🔍', verb: 'Searching for' },
   Glob: { emoji: '📂', verb: 'Listing files' },
   WebSearch: { emoji: '🔍', verb: 'Searching the web for' },
@@ -29,6 +30,7 @@ const TOOL_DISPLAY: Record<string, { emoji: string; verb: string }> = {
   KillShell: { emoji: '🛑', verb: 'Stopping shell' },
   LS: { emoji: '📂', verb: 'Listing' },
   View: { emoji: '👁️', verb: 'Viewing' },
+  ApplyPatch: { emoji: '✏️', verb: 'Editing' },
 };
 
 /** Lowercase fallback so case-insensitive tool names still match. */
@@ -60,10 +62,14 @@ export function lookupToolDisplay(name: string): { emoji: string; verb: string }
 export function buildToolPreview(name: string, input: unknown): string {
   try {
     if (input == null) return '';
-    if (typeof input === 'string') return input.slice(0, 120);
+    if (typeof input === 'string') {
+      // Sanitize: strip backticks (would break Feishu inline-code fences)
+      // and collapse newlines to keep the bubble single-line.
+      return input.replace(/`/g, "'").replace(/\n/g, ' ').trim().slice(0, 120);
+    }
     const obj = input as Record<string, unknown>;
     if (typeof obj !== 'object' || Array.isArray(obj)) {
-      return String(input).slice(0, 120);
+      return String(input).replace(/`/g, "'").replace(/\n/g, ' ').trim().slice(0, 120);
     }
     const lower = name.toLowerCase();
 
@@ -80,9 +86,9 @@ export function buildToolPreview(name: string, input: unknown): string {
       return `${base}${lineLabel}`.slice(0, 120);
     }
 
-    // Bash / shell: command first line
-    if (lower === 'bash' || lower === 'shell' || lower === 'terminal' || lower.includes('shell')) {
-      const cmd = (obj.command ?? obj.cmd ?? obj.script ?? '') as string;
+    // Bash / shell: command first line (codex "Run" tool included)
+    if (lower === 'bash' || lower === 'shell' || lower === 'terminal' || lower === 'run' || lower.includes('shell')) {
+      const cmd = (obj.command ?? obj.cmd ?? obj.script ?? obj.bash ?? '') as string;
       const oneLine = String(cmd).replace(/\n/g, ' ').trim();
       return oneLine.slice(0, 120);
     }

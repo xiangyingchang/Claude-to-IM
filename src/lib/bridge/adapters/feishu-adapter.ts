@@ -502,10 +502,24 @@ export class FeishuAdapter extends BaseChannelAdapter {
       this.activeCards.delete(chatId);
       // Start a fresh message; new segment shows only the delta.
       const replyTo = this.lastIncomingMessageId.get(chatId);
+      // Carry the tool-progress bubble across segments so it is NOT orphaned
+      // (code-review finding #2: fresh bubble per segment would accumulate).
+      const carryProgressMsgId = state.toolProgressMsgId;
+      const carryProgressLines = state.progressLines;
       this.createStreamingCard(chatId, replyTo).then((ok) => {
         if (!ok) return;
         const st = this.activeCards.get(chatId);
-        if (st) st.baseLength = fullText.length;
+        if (st) {
+          st.baseLength = fullText.length;
+          // Reuse the same tool-progress bubble across segments.
+          st.toolProgressMsgId = carryProgressMsgId;
+          st.progressLines = carryProgressLines;
+          st.lastProgressEditAt = state.lastProgressEditAt;
+          if (st.progressLines.length > 0) {
+            // Keep rendering the carried lines (status updates still land here).
+            this.flushToolProgress(chatId);
+          }
+        }
         // Re-queue current text so the next delta continues into the new message.
         this.updateCardContent(chatId, fullText);
       }).catch(() => {});
@@ -567,7 +581,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const name = tc.name || 'tool';
       const input = tc.input || '';
       const { emoji, verb } = lookupToolDisplay(name);
-      const isTerminal = /bash|shell|terminal|codex_shell/i.test(name);
+      const isTerminal = /bash|shell|terminal|codex_shell|^run$/i.test(name);
       if (isTerminal && input) {
         // Terminal command → header + fenced code block (Hermes style).
         const cmd = input.includes('\n') ? `${input.split('\n')[0].slice(0, 60)} ...` : input;
@@ -662,6 +676,28 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
+   * Finalize the standalone tool-progress bubble when the response completes:
+   * replace 🔄 running icons with ✅/❌ and push a final edit, so the bubble
+   * never stays stale "running" (code-review finding #2).
+   */
+  private finalizeToolProgressBubble(chatId: string, state: FeishuCardState): void {
+    if (!state.toolProgressMsgId || !this.restClient || state.progressLines.length === 0) return;
+
+    // Replace any 🔄 (running) prefixes with ✅ (complete) — best-effort:
+    // we don't track per-tool final status here, so any still-running tool is
+    // marked done. Failed tools were already rendered with ❌.
+    const finalized = state.progressLines.join('\n').replace(/🔄/g, '✅');
+    if (finalized === state.progressLines.join('\n')) return;
+
+    this.restClient.im.message.update({
+      path: { message_id: state.toolProgressMsgId },
+      data: { msg_type: 'post', content: buildPostContent(finalized) },
+    }).catch((err: unknown) => {
+      console.warn('[feishu-adapter] tool progress finalize failed:', err instanceof Error ? err.message : err);
+    });
+  }
+
+  /**
    * Finalize the streaming message: edit with final content + footer.
    * For complex markdown (code blocks/tables) which message.update cannot
    * render, send an interactive card and retract the preview message.
@@ -741,6 +777,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
       });
 
       console.log(`[feishu-adapter] Message finalized: msgId=${state.messageId}, status=${status}, elapsed=${elapsedLabel}`);
+
+      // Finalize the tool-progress bubble (code-review finding #2):
+      // replace 🔄 running icons with ✅/❌ so the bubble doesn't stay stale.
+      this.finalizeToolProgressBubble(chatId, state);
+
       return true;
     } catch (err) {
       console.warn('[feishu-adapter] Finalize failed:', err instanceof Error ? err.message : err);
