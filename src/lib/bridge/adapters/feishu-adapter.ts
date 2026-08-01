@@ -33,7 +33,6 @@ import {
   hasComplexMarkdown,
   buildCardContent,
   buildPostContent,
-  buildStreamingContent,
   buildFinalCardJson,
   buildPermissionButtonCard,
   buildButtonCard,
@@ -65,6 +64,14 @@ interface FeishuCardState {
   baseLength: number;
   /** Last content string sent, for dedup (skip no-op edits). */
   lastSentContent: string;
+  /** Message ID of the standalone tool-progress bubble (Hermes-style). */
+  toolProgressMsgId: string | null;
+  /** Accumulated tool lines for the progress bubble. */
+  progressLines: string[];
+  /** Timestamp of last progress-bubble edit (throttle). */
+  lastProgressEditAt: number;
+  /** Independent throttle timer for the tool-progress bubble. */
+  progressThrottleTimer: ReturnType<typeof setTimeout> | null;
 }
 
 /** Streaming update throttle interval (ms). */
@@ -230,6 +237,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Clean up active cards
     for (const [, state] of this.activeCards) {
       if (state.throttleTimer) clearTimeout(state.throttleTimer);
+      if (state.progressThrottleTimer) clearTimeout(state.progressThrottleTimer);
     }
     this.activeCards.clear();
     this.cardCreatePromises.clear();
@@ -423,6 +431,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
         editCount: 0,
         baseLength: 0,
         lastSentContent: '',
+        toolProgressMsgId: null,
+        progressLines: [],
+        lastProgressEditAt: 0,
+        progressThrottleTimer: null,
       });
 
       console.log(`[feishu-adapter] Streaming message created: msgId=${messageId}`);
@@ -498,8 +510,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     // Show only the delta since the last segment (baseLength).
+    // Tool progress lives in a separate bubble — text stream is pure text.
     const shown = (state.pendingText || '').slice(state.baseLength);
-    const content = buildStreamingContent(shown, state.toolCalls);
+    const content = shown || '💭 Thinking...';
     const postContent = buildPostContent(content);
 
     // Dedup: skip if content is identical to the last edit (no-op).
@@ -529,14 +542,100 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
-   * Update tool progress in the streaming card.
+   * Update tool progress — Hermes-style: render tool calls as a standalone
+   * progress bubble (with command code blocks) separate from the text stream,
+   * instead of embedding them inside the streaming text message.
+   *
+   * The bubble is created on the first tool event and edited in place with
+   * throttling, mirroring Hermes' send_progress_messages().
    */
   private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
     const state = this.activeCards.get(chatId);
-    if (!state) return;
+    if (!state || !this.restClient) return;
     state.toolCalls = tools;
-    // Trigger a content flush with current text + updated tools
-    this.updateCardContent(chatId, state.pendingText || '');
+
+    // Build compact progress lines (one per tool), Hermes-style:
+    //   💻 terminal  /  🔍 web_search  /  ✏️ edit
+    // Running tool gets 🔄 prefix; completed ✅; failed ❌.
+    // Bash/terminal commands render as fenced code blocks.
+    const lines: string[] = [];
+    for (const tc of tools) {
+      const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
+      const name = tc.name || 'tool';
+      const input = tc.input || '';
+      const isTerminal = /bash|shell|terminal|codex_shell/i.test(name);
+      if (isTerminal && input && !input.includes('\n')) {
+        // Single-line command → fenced code block
+        lines.push(`${icon} **${name}**\n\`\`\`\n${input}\n\`\`\``);
+      } else if (isTerminal && input) {
+        // Multi-line command → first line + ellipsis
+        const first = input.split('\n')[0].slice(0, 60);
+        lines.push(`${icon} **${name}**\n\`\`\`\n${first} ...\n\`\`\``);
+      } else if (input) {
+        lines.push(`${icon} **${name}** \`${input}\``);
+      } else {
+        lines.push(`${icon} **${name}**`);
+      }
+    }
+
+    // Skip if nothing changed (dedup).
+    const joined = lines.join('\n');
+    if (joined === state.progressLines.join('\n')) return;
+
+    state.progressLines = lines;
+
+    // Throttle edits like Hermes (_PROGRESS_EDIT_INTERVAL = 1.5s).
+    const now = Date.now();
+    if (state.toolProgressMsgId && (now - state.lastProgressEditAt) < 1500) {
+      // Schedule a trailing-edge flush.
+      if (!state.progressThrottleTimer) {
+        state.progressThrottleTimer = setTimeout(() => {
+          state.progressThrottleTimer = null;
+          this.flushToolProgress(chatId);
+        }, 1500 - (now - state.lastProgressEditAt));
+      }
+      return;
+    }
+
+    this.flushToolProgress(chatId);
+  }
+
+  /**
+   * Create or edit the standalone tool-progress bubble.
+   * First call creates a new post message; later calls edit it in place.
+   */
+  private flushToolProgress(chatId: string): void {
+    const state = this.activeCards.get(chatId);
+    if (!state || !this.restClient || state.progressLines.length === 0) return;
+
+    const content = buildPostContent(state.progressLines.join('\n'));
+
+    if (state.toolProgressMsgId) {
+      // Edit existing bubble.
+      this.restClient.im.message.update({
+        path: { message_id: state.toolProgressMsgId },
+        data: { msg_type: 'post', content },
+      }).then(() => {
+        state.lastProgressEditAt = Date.now();
+      }).catch((err: unknown) => {
+        console.warn('[feishu-adapter] tool progress update failed:', err instanceof Error ? err.message : err);
+      });
+      return;
+    }
+
+    // Create a new bubble (first tool event).
+    this.restClient.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'post', content },
+    }).then((res) => {
+      const mid = res?.data?.message_id;
+      if (mid) {
+        state.toolProgressMsgId = mid;
+        state.lastProgressEditAt = Date.now();
+      }
+    }).catch((err: unknown) => {
+      console.warn('[feishu-adapter] tool progress create failed:', err instanceof Error ? err.message : err);
+    });
   }
 
   /**
@@ -562,6 +661,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (state.throttleTimer) {
       clearTimeout(state.throttleTimer);
       state.throttleTimer = null;
+    }
+    if (state.progressThrottleTimer) {
+      clearTimeout(state.progressThrottleTimer);
+      state.progressThrottleTimer = null;
     }
 
     try {
@@ -607,7 +710,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
       }
 
       // Simple text — edit the streaming post with final content + footer.
-      const display = buildStreamingContent(responseText, state.toolCalls);
+      const display = responseText || '💭 Thinking...';
       const finalContent = `${display}\n\n${statusLabel} · ${elapsedLabel}`;
       await this.restClient.im.message.update({
         path: { message_id: state.messageId },
@@ -633,6 +736,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!state) return;
     if (state.throttleTimer) {
       clearTimeout(state.throttleTimer);
+    }
+    if (state.progressThrottleTimer) {
+      clearTimeout(state.progressThrottleTimer);
     }
     this.activeCards.delete(chatId);
   }
