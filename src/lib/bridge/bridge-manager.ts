@@ -727,6 +727,9 @@ async function handleMessage(
     const promptText = text || (hasAttachments ? 'Describe this image.' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
+      // Keep the visible stream ordered: text already received by the user
+      // must land before the permission card that pauses the agent.
+      await adapter.onStreamBarrier?.(msg.address.chatId);
       await broker.forwardPermissionRequest(
         adapter,
         msg.address,

@@ -111,6 +111,12 @@ export abstract class BaseChannelAdapter {
   onToolEvent?(_chatId: string, _tools: import('./types.js').ToolCallInfo[]): void;
 
   /**
+   * Flush all pending streaming writes before an ordered outbound message,
+   * such as a permission card, is sent.
+   */
+  onStreamBarrier?(_chatId: string): Promise<void>;
+
+  /**
    * Called when streaming ends. Adapter should finalize the streaming card
    * (close streaming mode, add footer, etc.).
    * Returns true if a card was finalized (caller should skip normal delivery).

@@ -28,6 +28,8 @@ import type { ToolCallInfo } from '../types.js';
 import { BaseChannelAdapter, registerAdapterFactory } from '../channel-adapter.js';
 import { getBridgeContext } from '../context.js';
 import { lookupToolDisplay } from '../tool-display.js';
+import { FeishuStreamCoordinator } from './feishu-stream-coordinator.js';
+import type { FeishuStreamTransport } from './feishu-stream-coordinator.js';
 import {
   htmlToFeishuMarkdown,
   preprocessFeishuMarkdown,
@@ -37,7 +39,6 @@ import {
   buildFinalCardJson,
   buildPermissionButtonCard,
   buildButtonCard,
-  formatElapsed,
 } from '../markdown/feishu.js';
 
 /** Max number of message_ids to keep for dedup. */
@@ -48,45 +49,6 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
-
-/** State for an active streaming message (post-based progressive edit). */
-interface FeishuCardState {
-  messageId: string;
-  sequence: number;
-  startTime: number;
-  toolCalls: ToolCallInfo[];
-  thinking: boolean;
-  pendingText: string | null;
-  lastUpdateAt: number;
-  throttleTimer: ReturnType<typeof setTimeout> | null;
-  /** Progressive edit counter — Feishu caps edits per message at 20. */
-  editCount: number;
-  /** Length of text already shown in prior segment(s); new segment shows only the delta. */
-  baseLength: number;
-  /** Last content string sent, for dedup (skip no-op edits). */
-  lastSentContent: string;
-  /** Message ID of the standalone tool-progress bubble (Hermes-style). */
-  toolProgressMsgId: string | null;
-  /** Accumulated tool lines for the progress bubble. */
-  progressLines: string[];
-  /** Timestamp of last progress-bubble edit (throttle). */
-  lastProgressEditAt: number;
-  /** Independent throttle timer for the tool-progress bubble. */
-  progressThrottleTimer: ReturnType<typeof setTimeout> | null;
-  /** Edit count for the tool-progress bubble — Feishu caps edits per message at 20. */
-  progressEditCount: number;
-}
-
-/** Streaming update throttle interval (ms). */
-const CARD_THROTTLE_MS = 500;
-
-/** Max progressive edits per message before we start a fresh message.
- *  Feishu's edit-message API allows at most 20 edits per message; we stay
- *  well under with room for the finalize edit. */
-const MAX_EDITS_PER_MESSAGE = 12;
-
-/** Max edits for the tool-progress bubble before it segments (same 20 cap). */
-const MAX_PROGRESS_EDITS = 15;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -140,12 +102,34 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private lastIncomingMessageId = new Map<string, string>();
   /** Track active typing reaction IDs per chat for cleanup. */
   private typingReactions = new Map<string, string>();
-  /** In-flight guard for standalone tool-progress bubble creation (avoids duplicate bubbles on parallel tool events). */
-  private toolProgressCreatePromises = new Map<string, Promise<void>>();
-  /** Active streaming card state per chatId. */
-  private activeCards = new Map<string, FeishuCardState>();
-  /** In-flight card creation promises per chatId — prevents duplicate creation. */
-  private cardCreatePromises = new Map<string, Promise<boolean>>();
+  /** Hermes-style single-writer coordinator for Feishu streaming messages. */
+  private readonly streamCoordinator: FeishuStreamCoordinator;
+
+  constructor() {
+    super();
+    const transport: FeishuStreamTransport = {
+      createPost: (chatId, content, replyToMessageId) =>
+        this.createStreamingPost(chatId, content, replyToMessageId),
+      updatePost: (messageId, content) => this.updateStreamingPost(messageId, content),
+      createInteractive: (chatId, content) => this.createStreamingInteractive(chatId, content),
+      deleteMessage: (messageId) => this.deleteStreamingMessage(messageId),
+    };
+
+    this.streamCoordinator = new FeishuStreamCoordinator(transport, {
+      post: (text) => buildPostContent(text),
+      progress: (tools) => {
+        const lines = this.buildToolProgressLines(tools);
+        return { lines, content: buildPostContent(lines.join('\n')) };
+      },
+      finalizeProgress: (content) => content.replace(/🔄/g, '✅'),
+      finalCard: (text, tools, footer) => buildFinalCardJson(text, tools, footer),
+      hasComplexMarkdown,
+    }, {
+      onError: (scope, error) => {
+        console.warn('[feishu-adapter]', scope, error instanceof Error ? error.message : error);
+      },
+    });
+  }
 
   // ── Lifecycle ───────────────────────────────────────────────
 
@@ -242,13 +226,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
     this.waiters = [];
 
-    // Clean up active cards
-    for (const [, state] of this.activeCards) {
-      if (state.throttleTimer) clearTimeout(state.throttleTimer);
-      if (state.progressThrottleTimer) clearTimeout(state.progressThrottleTimer);
-    }
-    this.activeCards.clear();
-    this.cardCreatePromises.clear();
+    // Clean up active streaming coordinators.
+    this.streamCoordinator.cleanupAll();
 
     // Clear state
     this.seenMessageIds.clear();
@@ -293,10 +272,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   onMessageStart(chatId: string): void {
     const messageId = this.lastIncomingMessageId.get(chatId);
 
-    // Create streaming card (fire-and-forget — fallback to traditional if fails)
-    if (messageId) {
-      this.createStreamingCard(chatId, messageId).catch(() => {});
-    }
+    // The coordinator serializes card creation before the first text event.
+    this.streamCoordinator.start(chatId, messageId);
 
     // Typing indicator (same as before)
     if (!messageId || !this.restClient) return;
@@ -321,8 +298,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
    * Called by bridge-manager via onMessageEnd().
    */
   onMessageEnd(chatId: string): void {
-    // Clean up any orphaned card state (normally cleaned by finalizeCard)
-    this.cleanupCard(chatId);
+    this.streamCoordinator.cleanup(chatId);
 
     // Remove typing reaction (same as before)
     const reactionId = this.typingReactions.get(chatId);
@@ -378,210 +354,69 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  // ── Streaming (progressive post-message edit) ─────────────────
+  // ── Streaming (Hermes-style single-writer coordinator) ─────────
 
-  /**
-   * Create a new streaming message and send it as a post.
-   * Returns true if created successfully.
-   */
-  private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
-    if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
+  private async createStreamingPost(
+    chatId: string,
+    content: string,
+    replyToMessageId?: string,
+  ): Promise<string | null> {
+    if (!this.restClient) throw new Error('Feishu client not initialized');
 
-    // In-flight guard: if creation is already in progress, return the existing promise
-    const existing = this.cardCreatePromises.get(chatId);
-    if (existing) return existing;
-
-    const promise = this._doCreateStreamingCard(chatId, replyToMessageId);
-    this.cardCreatePromises.set(chatId, promise);
-    promise.finally(() => this.cardCreatePromises.delete(chatId));
-    return promise;
-  }
-
-  private async _doCreateStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
-    if (!this.restClient) return false;
-
-    try {
-      const content = buildPostContent('💭 Thinking...');
-
-      let msgResp;
-      if (replyToMessageId) {
-        msgResp = await this.restClient.im.message.reply({
-          path: { message_id: replyToMessageId },
-          data: { content, msg_type: 'post' },
-        });
-      } else {
-        msgResp = await this.restClient.im.message.create({
-          params: { receive_id_type: 'chat_id' },
-          data: {
-            receive_id: chatId,
-            msg_type: 'post',
-            content,
-          },
-        });
-      }
-
-      const messageId = msgResp?.data?.message_id;
-      if (!messageId) {
-        console.warn('[feishu-adapter] Streaming message send returned no message_id');
-        return false;
-      }
-
-      // Store streaming state
-      this.activeCards.set(chatId, {
-        messageId,
-        sequence: 0,
-        startTime: Date.now(),
-        toolCalls: [],
-        thinking: true,
-        pendingText: null,
-        lastUpdateAt: 0,
-        throttleTimer: null,
-        editCount: 0,
-        baseLength: 0,
-        lastSentContent: '',
-        toolProgressMsgId: null,
-        progressLines: [],
-        lastProgressEditAt: 0,
-        progressThrottleTimer: null,
-        progressEditCount: 0,
+    const response: any = replyToMessageId
+      ? await this.restClient.im.message.reply({
+        path: { message_id: replyToMessageId },
+        data: { content, msg_type: 'post' },
+      })
+      : await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: 'post', content },
       });
 
-      console.log(`[feishu-adapter] Streaming message created: msgId=${messageId}`);
-      return true;
-    } catch (err) {
-      console.warn('[feishu-adapter] Failed to create streaming message:', err instanceof Error ? err.message : err);
-      return false;
-    }
+    this.throwForFeishuResponse(response, 'streaming post create');
+    const messageId = response?.data?.message_id;
+    if (!messageId) throw new Error('Streaming message send returned no message_id');
+    console.log(`[feishu-adapter] Streaming message created: msgId=${messageId}`);
+    return messageId;
   }
 
-  /**
-   * Update streaming card content with throttling.
-   */
-  private updateCardContent(chatId: string, text: string): void {
-    const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient) return;
-
-    // Clear thinking state once text arrives
-    if (state.thinking && text.trim()) {
-      state.thinking = false;
-    }
-    state.pendingText = text;
-
-    const elapsed = Date.now() - state.lastUpdateAt;
-    if (elapsed < CARD_THROTTLE_MS && state.lastUpdateAt > 0) {
-      // Schedule trailing-edge flush
-      if (!state.throttleTimer) {
-        state.throttleTimer = setTimeout(() => {
-          state.throttleTimer = null;
-          this.flushCardUpdate(chatId);
-        }, CARD_THROTTLE_MS - elapsed);
-      }
-      return;
-    }
-
-    // Clear pending timer and flush immediately
-    if (state.throttleTimer) {
-      clearTimeout(state.throttleTimer);
-      state.throttleTimer = null;
-    }
-    this.flushCardUpdate(chatId);
-  }
-
-  /**
-   * Flush pending streaming update to Feishu API via message update (PUT).
-   */
-  private flushCardUpdate(chatId: string): void {
-    const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient) return;
-
-    // Feishu caps edits per message at 20. When we approach the cap, finalize
-    // the current message and start a fresh one for continued streaming.
-    if (state.editCount >= MAX_EDITS_PER_MESSAGE) {
-      const fullText = state.pendingText || '';
-      // Finalize current message (quietly — no status footer, just current text)
-      this.restClient.im.message.update({
-        path: { message_id: state.messageId },
-        data: { msg_type: 'post', content: buildPostContent(fullText || '💭 Thinking...') },
-      }).catch((err: unknown) => {
-        console.warn('[feishu-adapter] segment-finalize update failed:', err instanceof Error ? err.message : err);
-      });
-      this.activeCards.delete(chatId);
-      // Start a fresh message; new segment shows only the delta.
-      const replyTo = this.lastIncomingMessageId.get(chatId);
-      // Carry the tool-progress bubble across segments so it is NOT orphaned
-      // (code-review finding #2: fresh bubble per segment would accumulate).
-      const carryProgressMsgId = state.toolProgressMsgId;
-      const carryProgressLines = state.progressLines;
-      this.createStreamingCard(chatId, replyTo).then((ok) => {
-        if (!ok) return;
-        const st = this.activeCards.get(chatId);
-        if (st) {
-          st.baseLength = fullText.length;
-          // Reuse the same tool-progress bubble across segments.
-          st.toolProgressMsgId = carryProgressMsgId;
-          st.progressLines = carryProgressLines;
-          st.lastProgressEditAt = state.lastProgressEditAt;
-          st.progressEditCount = state.progressEditCount;
-          if (st.progressLines.length > 0) {
-            // Keep rendering the carried lines (status updates still land here).
-            this.flushToolProgress(chatId);
-          }
-        }
-        // Re-queue current text so the next delta continues into the new message.
-        this.updateCardContent(chatId, fullText);
-      }).catch(() => {});
-      return;
-    }
-
-    // Show only the delta since the last segment (baseLength).
-    // Tool progress lives in a separate bubble — text stream is pure text.
-    const shown = (state.pendingText || '').slice(state.baseLength);
-    const content = shown || '💭 Thinking...';
-    const postContent = buildPostContent(content);
-
-    // Dedup: skip if content is identical to the last edit (no-op).
-    if (postContent === state.lastSentContent) return;
-
-    state.sequence++;
-    const messageId = state.messageId;
-
-    // Count optimistically BEFORE sending: Feishu counts every successful PUT
-    // against the 20-edit cap, so we must reserve budget synchronously —
-    // otherwise concurrent flushes all read the same stale editCount and blow
-    // past the cap (error 230072).
-    state.editCount++;
-    state.lastSentContent = postContent;
-    state.lastUpdateAt = Date.now();
-
-    // Fire-and-forget — streaming updates are non-critical
-    this.restClient.im.message.update({
+  private async updateStreamingPost(messageId: string, content: string): Promise<void> {
+    if (!this.restClient) throw new Error('Feishu client not initialized');
+    const response: any = await this.restClient.im.message.update({
       path: { message_id: messageId },
-      data: { msg_type: 'post', content: postContent },
-    }).catch((err: unknown) => {
-      // A failed edit still consumed budget server-side only if it reached the
-      // API; be conservative and log, but do not roll back editCount (retrying
-      // same content is usually pointless).
-      console.warn('[feishu-adapter] message.update failed:', err instanceof Error ? err.message : err);
+      data: { msg_type: 'post', content },
     });
+    this.throwForFeishuResponse(response, 'streaming post update');
   }
 
-  /**
-   * Update tool progress — Hermes-style: render tool calls as a standalone
-   * progress bubble (emoji + verb + preview, bash commands as fenced code
-   * blocks) separate from the text stream, mirroring Hermes'
-   * send_progress_messages(). The bubble is created on the first tool event
-   * and edited in place with throttling.
-   */
-  private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
-    const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient) return;
-    state.toolCalls = tools;
+  private async createStreamingInteractive(chatId: string, content: string): Promise<string | null> {
+    if (!this.restClient) throw new Error('Feishu client not initialized');
+    const response: any = await this.restClient.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'interactive', content },
+    });
+    this.throwForFeishuResponse(response, 'streaming final card create');
+    return response?.data?.message_id || null;
+  }
 
-    // Build compact progress lines (one per tool), Hermes-style:
-    //   📖 Reading feishu-adapter.ts L218-247
-    //   💻 Running git status        (bash → fenced code block)
-    //   ✏️ Editing file.ts
-    // Running tool gets 🔄 prefix; completed ✅; failed ❌.
+  private async deleteStreamingMessage(messageId: string): Promise<void> {
+    if (!this.restClient) return;
+    const response: any = await this.restClient.im.message.delete({
+      path: { message_id: messageId },
+    });
+    this.throwForFeishuResponse(response, 'streaming preview delete');
+  }
+
+  private throwForFeishuResponse(response: any, operation: string): void {
+    const code = response?.code;
+    if (typeof code === 'number' && code !== 0) {
+      const error = new Error(`${operation} failed: ${response?.msg || `code ${code}`}`);
+      (error as Error & { code?: number }).code = code;
+      throw error;
+    }
+  }
+
+  private buildToolProgressLines(tools: ToolCallInfo[]): string[] {
     const lines: string[] = [];
     for (const tc of tools) {
       const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
@@ -590,7 +425,6 @@ export class FeishuAdapter extends BaseChannelAdapter {
       const { emoji, verb } = lookupToolDisplay(name);
       const isTerminal = /bash|shell|terminal|codex_shell|^run$/i.test(name);
       if (isTerminal && input) {
-        // Terminal command → header + fenced code block (Hermes style).
         const cmd = input.includes('\n') ? `${input.split('\n')[0].slice(0, 60)} ...` : input;
         lines.push(`${icon} ${emoji} ${verb}\n\`\`\`\n${cmd}\n\`\`\``);
       } else if (input) {
@@ -599,321 +433,32 @@ export class FeishuAdapter extends BaseChannelAdapter {
         lines.push(`${icon} ${emoji} ${verb}`);
       }
     }
-
-    // Skip if nothing changed (dedup).
-    const joined = lines.join('\n');
-    if (joined === state.progressLines.join('\n')) return;
-
-    state.progressLines = lines;
-
-    // Throttle edits like Hermes (_PROGRESS_EDIT_INTERVAL = 1.5s).
-    const now = Date.now();
-    if (state.toolProgressMsgId && (now - state.lastProgressEditAt) < 1500) {
-      // Schedule a trailing-edge flush.
-      if (!state.progressThrottleTimer) {
-        state.progressThrottleTimer = setTimeout(() => {
-          state.progressThrottleTimer = null;
-          this.flushToolProgress(chatId);
-        }, 1500 - (now - state.lastProgressEditAt));
-      }
-      return;
-    }
-
-    this.flushToolProgress(chatId);
+    return lines;
   }
 
-  /**
-   * Create or edit the standalone tool-progress bubble.
-   * First call creates a new post message; later calls edit it in place.
-   * In-flight guarded: parallel tool events before the first create resolves
-   * must NOT spawn duplicate bubbles (race found in code review).
-   */
-  private flushToolProgress(chatId: string): void {
-    const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient || state.progressLines.length === 0) return;
-
-    const content = buildPostContent(state.progressLines.join('\n'));
-
-    if (state.toolProgressMsgId) {
-      // Feishu caps edits per message at 20 — segment the bubble when we
-      // approach the cap: keep the old bubble as-is and start a fresh one
-      // on the next flush (toolProgressMsgId reset → create path).
-      if (state.progressEditCount >= MAX_PROGRESS_EDITS) {
-        state.toolProgressMsgId = null;
-        state.progressEditCount = 0;
-        // Re-dispatch so the current lines land in a fresh bubble.
-        this.flushToolProgress(chatId);
-        return;
-      }
-      // Edit existing bubble.
-      this.restClient.im.message.update({
-        path: { message_id: state.toolProgressMsgId },
-        data: { msg_type: 'post', content },
-      }).then(() => {
-        state.lastProgressEditAt = Date.now();
-      }).catch((err: unknown) => {
-        console.warn('[feishu-adapter] tool progress update failed:', err instanceof Error ? err.message : err);
-      });
-      state.progressEditCount++;
-      return;
-    }
-
-    // In-flight guard: if a create is already pending for this chat, wait for
-    // it (then the next flush will edit the now-existing bubble). This prevents
-    // duplicate bubbles when several tool events arrive before the first
-    // im.message.create resolves (very common with parallel tool calls).
-    const existingCreate = this.toolProgressCreatePromises.get(chatId);
-    if (existingCreate) {
-      existingCreate.then(() => {
-        // Re-run flush when creation resolved. toolProgressMsgId is set on
-        // success (edit path); on segmentation reset it is null but lines are
-        // buffered — retry the create path rather than dropping the update.
-        const st = this.activeCards.get(chatId);
-        if (st && (st.toolProgressMsgId || st.progressLines.length > 0)) {
-          this.flushToolProgress(chatId);
-        }
-      }).catch(() => {});
-      return;
-    }
-
-    // Create a new bubble (first tool event).
-    const createPromise = this.restClient.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'post', content },
-    }).then((res) => {
-      const mid = res?.data?.message_id;
-      if (mid) {
-        state.toolProgressMsgId = mid;
-        state.lastProgressEditAt = Date.now();
-      }
-    }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] tool progress create failed:', err instanceof Error ? err.message : err);
-    }).finally(() => {
-      this.toolProgressCreatePromises.delete(chatId);
-    });
-
-    this.toolProgressCreatePromises.set(chatId, createPromise);
+  hasActiveCard(chatId: string): boolean {
+    return this.streamCoordinator.hasActive(chatId);
   }
 
-  /**
-   * Finalize the standalone tool-progress bubble when the response completes:
-   * replace 🔄 running icons with ✅/❌ and push a final edit, so the bubble
-   * never stays stale "running" (code-review finding #2).
-   */
-  private finalizeToolProgressBubble(chatId: string, state: FeishuCardState): void {
-    if (!state.toolProgressMsgId || !this.restClient || state.progressLines.length === 0) return;
-
-    // Replace any 🔄 (running) prefixes with ✅ (complete) — best-effort:
-    // we don't track per-tool final status here, so any still-running tool is
-    // marked done. Failed tools were already rendered with ❌.
-    const finalized = state.progressLines.join('\n').replace(/🔄/g, '✅');
-    if (finalized === state.progressLines.join('\n')) return;
-
-    this.restClient.im.message.update({
-      path: { message_id: state.toolProgressMsgId },
-      data: { msg_type: 'post', content: buildPostContent(finalized) },
-    }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] tool progress finalize failed:', err instanceof Error ? err.message : err);
-    });
+  onStreamText(chatId: string, fullText: string): void {
+    this.streamCoordinator.onText(chatId, fullText);
   }
 
-  /**
-   * Finalize the streaming message: edit with final content + footer.
-   * For complex markdown (code blocks/tables) which message.update cannot
-   * render, send an interactive card and retract the preview message.
-   */
-  private async finalizeCard(
+  onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
+    this.streamCoordinator.onTools(chatId, tools);
+  }
+
+  /** Flushes streaming writes before an ordered permission card is sent. */
+  onStreamBarrier(chatId: string): Promise<void> {
+    return this.streamCoordinator.flush(chatId);
+  }
+
+  async onStreamEnd(
     chatId: string,
     status: 'completed' | 'interrupted' | 'error',
     responseText: string,
   ): Promise<boolean> {
-    // Wait for in-flight card creation to complete before finalizing
-    const pending = this.cardCreatePromises.get(chatId);
-    if (pending) {
-      try { await pending; } catch { /* creation failed — no card to finalize */ }
-    }
-
-    const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient) return false;
-
-    // Clear any pending throttle timer
-    if (state.throttleTimer) {
-      clearTimeout(state.throttleTimer);
-      state.throttleTimer = null;
-    }
-    if (state.progressThrottleTimer) {
-      clearTimeout(state.progressThrottleTimer);
-      state.progressThrottleTimer = null;
-    }
-
-    try {
-      const statusLabels: Record<string, string> = {
-        completed: '✅ Completed',
-        interrupted: '⚠️ Interrupted',
-        error: '❌ Error',
-      };
-      const elapsedMs = Date.now() - state.startTime;
-      const statusLabel = statusLabels[status] || status;
-      const elapsedLabel = formatElapsed(elapsedMs);
-
-      // Complex markdown (code blocks/tables) cannot be edited in place via
-      // message.update (only text/post supported). Send as an interactive card
-      // and retract the streaming preview so the user sees one clean result.
-      if (hasComplexMarkdown(responseText)) {
-        const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, {
-          status: statusLabel,
-          elapsed: elapsedLabel,
-        });
-        try {
-          const cardRes = await this.restClient.im.message.create({
-            params: { receive_id_type: 'chat_id' },
-            data: {
-              receive_id: chatId,
-              msg_type: 'interactive',
-              content: finalCardJson,
-            },
-          });
-          if (cardRes?.data?.message_id) {
-            // Retract the streaming preview message (best effort).
-            await this.restClient.im.message.delete({
-              path: { message_id: state.messageId },
-            }).catch(() => {});
-            console.log(`[feishu-adapter] Final card sent (complex md), preview retracted: status=${status}, elapsed=${elapsedLabel}`);
-            return true;
-          }
-          console.warn('[feishu-adapter] Final card send failed:', cardRes?.msg, cardRes?.code);
-        } catch (err) {
-          console.warn('[feishu-adapter] Final card send error:', err instanceof Error ? err.message : err);
-        }
-        // Fall through to post edit if card path failed.
-      }
-
-      // Simple text — edit the streaming post with final content + footer.
-      const display = responseText || '💭 Thinking...';
-      const finalContent = `${display}\n\n${statusLabel} · ${elapsedLabel}`;
-      await this.restClient.im.message.update({
-        path: { message_id: state.messageId },
-        data: { msg_type: 'post', content: buildPostContent(finalContent) },
-      });
-
-      console.log(`[feishu-adapter] Message finalized: msgId=${state.messageId}, status=${status}, elapsed=${elapsedLabel}`);
-
-      // Finalize the tool-progress bubble (code-review finding #2):
-      // replace 🔄 running icons with ✅/❌ so the bubble doesn't stay stale.
-      this.finalizeToolProgressBubble(chatId, state);
-
-      return true;
-    } catch (err) {
-      console.warn('[feishu-adapter] Finalize failed:', err instanceof Error ? err.message : err);
-      return false;
-    } finally {
-      this.activeCards.delete(chatId);
-    }
-  }
-
-  /**
-   * Clean up card state without finalizing (e.g. on unexpected errors).
-   */
-  private cleanupCard(chatId: string): void {
-    this.cardCreatePromises.delete(chatId);
-    const state = this.activeCards.get(chatId);
-    if (!state) return;
-    if (state.throttleTimer) {
-      clearTimeout(state.throttleTimer);
-    }
-    if (state.progressThrottleTimer) {
-      clearTimeout(state.progressThrottleTimer);
-    }
-    this.activeCards.delete(chatId);
-  }
-
-  /**
-   * Check if there is an active streaming card for a given chat.
-   */
-  hasActiveCard(chatId: string): boolean {
-    return this.activeCards.has(chatId);
-  }
-
-  // ── Streaming adapter interface ────────────────────────────────
-
-  /**
-   * Called by bridge-manager on each text SSE event.
-   * Creates streaming card on first call, then updates content.
-   */
-  onStreamText(chatId: string, fullText: string): void {
-    if (!this.activeCards.has(chatId)) {
-      // Card should have been created by onMessageStart, but create lazily if not
-      const messageId = this.lastIncomingMessageId.get(chatId);
-      this.createStreamingCard(chatId, messageId).then((ok) => {
-        if (ok) this.updateCardContent(chatId, fullText);
-      }).catch(() => {});
-      return;
-    }
-    this.updateCardContent(chatId, fullText);
-  }
-
-  onToolEvent(chatId: string, tools: ToolCallInfo[]): void {
-    // Update the tool-progress bubble FIRST (state must still exist), then
-    // check for a tool boundary (Hermes on_segment_break): when a NEW tool
-    // starts running, finalize the current text message so subsequent text
-    // appears as a fresh message below the tool progress bubble. This stops
-    // the text message from growing unboundedly across many tool calls.
-    const state = this.activeCards.get(chatId);
-    const hasNewTool = state && state.pendingText
-      ? tools.some((t) => t.status === 'running' && !new Set(state.toolCalls.map((t2) => t2.id)).has(t.id))
-      : false;
-    this.updateToolProgress(chatId, tools);
-    if (hasNewTool) {
-      this.segmentBreak(chatId);
-    }
-  }
-
-  /**
-   * Hermes-style segment break: finalize the current streaming text message
-   * as-is (no status footer), then reset so the next onStreamText delta is
-   * rendered into a brand-new message. Tool-progress bubbles and edit
-   * accounting carry across the break.
-   */
-  private segmentBreak(chatId: string): void {
-    const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient || !state.pendingText) return;
-
-    const fullText = state.pendingText;
-    // Quiet finalize: edit current message to its full text (no footer).
-    this.restClient.im.message.update({
-      path: { message_id: state.messageId },
-      data: { msg_type: 'post', content: buildPostContent(fullText) },
-    }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] segment-break finalize failed:', err instanceof Error ? err.message : err);
-    });
-
-    // Carry tool-progress bubble + edit accounting into the next message.
-    const carryProgressMsgId = state.toolProgressMsgId;
-    const carryProgressLines = state.progressLines;
-    const carryLastProgressEditAt = state.lastProgressEditAt;
-    const carryProgressEditCount = state.progressEditCount;
-    const carryBaseLength = fullText.length;
-
-    this.activeCards.delete(chatId);
-    const replyTo = this.lastIncomingMessageId.get(chatId);
-    this.createStreamingCard(chatId, replyTo).then((ok) => {
-      if (!ok) return;
-      const st = this.activeCards.get(chatId);
-      if (st) {
-        st.baseLength = carryBaseLength;
-        st.toolProgressMsgId = carryProgressMsgId;
-        st.progressLines = carryProgressLines;
-        st.lastProgressEditAt = carryLastProgressEditAt;
-        st.progressEditCount = carryProgressEditCount;
-        if (st.progressLines.length > 0) {
-          this.flushToolProgress(chatId);
-        }
-      }
-    }).catch(() => {});
-  }
-
-  async onStreamEnd(chatId: string, status: 'completed' | 'interrupted' | 'error', responseText: string): Promise<boolean> {
-    return this.finalizeCard(chatId, status, responseText);
+    return this.streamCoordinator.end(chatId, status, responseText);
   }
 
   // ── Send ────────────────────────────────────────────────────
