@@ -139,6 +139,7 @@ export class FeishuStreamCoordinator {
       const state = this.states.get(chatId);
       if (!state || state.finalized) return;
       this.clearContentTimer(state);
+      await this.materializeHeldText(state);
       await this.flushText(state);
       await this.flushToolGroup(state);
     });
@@ -228,6 +229,13 @@ export class FeishuStreamCoordinator {
     }
 
     if (!textAfterBoundary.trim()) return;
+
+    // The first text after a tool group may be the eventual final answer. Hold
+    // it in memory until the turn ends; if another tool starts, that tool is
+    // the proof this text was an intermediate segment and we materialize it
+    // immediately before the next tool group. This avoids sending a staging
+    // message and then visibly recalling it when the final answer arrives.
+    if (!state.currentSegment && state.toolGroupSerial > 0) return;
 
     if (!state.currentSegment) {
       await this.createTextSegment(state, textAfterBoundary);
@@ -332,6 +340,7 @@ export class FeishuStreamCoordinator {
   ): Promise<void> {
     if (!state.currentToolGroup) {
       this.clearContentTimer(state);
+      await this.materializeHeldText(state);
       await this.closeTextSegment(state);
       state.toolGroupSerial++;
       state.currentToolGroup = {
@@ -361,6 +370,7 @@ export class FeishuStreamCoordinator {
   ): Promise<void> {
     if (!state.currentToolGroup) {
       this.clearContentTimer(state);
+      await this.materializeHeldText(state);
       await this.closeTextSegment(state);
       state.toolGroupSerial++;
       state.currentToolGroup = {
@@ -393,6 +403,13 @@ export class FeishuStreamCoordinator {
     }
     state.currentSegment = null;
     state.segmentBaseLength = state.pendingText.length;
+  }
+
+  /** Materialize text after a closed tool group only when it is known to be intermediate. */
+  private async materializeHeldText(state: StreamState): Promise<void> {
+    if (state.currentSegment || state.currentToolGroup || state.toolGroupSerial === 0) return;
+    const text = this.currentText(state);
+    if (text.trim()) await this.createTextSegment(state, text);
   }
 
   private async flushToolGroup(state: StreamState): Promise<void> {
@@ -465,7 +482,12 @@ export class FeishuStreamCoordinator {
     this.clearContentTimer(state);
     if (responseText.length > state.pendingText.length) state.pendingText = responseText;
 
-    await this.flushText(state);
+    // Text after the final tool group is intentionally held for the final
+    // message. Flushing it here would create a staging post that must then be
+    // recalled. Text before any tool still streams normally.
+    if (state.currentSegment || state.toolGroupSerial === 0) {
+      await this.flushText(state);
+    }
     if (state.currentToolGroup && status === 'interrupted') {
       for (const tool of state.currentToolGroup.tools) {
         if (tool.status === 'running') tool.status = 'error';
@@ -494,13 +516,20 @@ export class FeishuStreamCoordinator {
       ? ''
       : `\n\n${finalStatus} · ${elapsed}`;
 
-    // The mutable preview for the final text is only a staging message. Keep
-    // earlier text/tool groups, remove the final staging segment, then create
-    // a dedicated final message so it is physically last in Feishu.
-    await this.removeFinalPreviewSegments(state);
-
+    const complexFinal = this.renderer.hasComplexMarkdown(finalText);
     let delivered = false;
-    if (this.renderer.hasComplexMarkdown(finalText)) {
+    if (!complexFinal && state.currentSegment && state.currentSegment.toolGroupSerial === state.toolGroupSerial) {
+      // A normal Markdown text segment is already the final visible message.
+      // Promote it in place instead of recalling it and creating a duplicate.
+      state.finalized = true;
+      state.finalMessageId = state.currentSegment.messageId;
+      return true;
+    }
+
+    // Complex Markdown needs a card message type. Only this exceptional path
+    // removes a previously-created post staging segment.
+    if (complexFinal) {
+      await this.removeFinalPreviewSegments(state);
       delivered = await this.tryCreateFinal(
         state,
         () => this.transport.createInteractive(chatId, this.renderer.finalCard(finalText, footer)),

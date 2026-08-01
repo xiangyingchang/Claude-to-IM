@@ -121,8 +121,9 @@ describe('FeishuStreamCoordinator', () => {
     assert.ok(groupLastIndex >= 0 && groupLastIndex < finalIndex, 'final message must be created after the tool group');
     assert.equal(operations[finalIndex]?.content?.includes('Completed'), false);
 
-    // The staging text after the last tool is removed; the execution group is kept.
-    assert.ok(operations.some((operation) => operation.type === 'delete' && operation.id !== groupId));
+    // The final text after the last tool was held until completion; no staging
+    // message was created and therefore no recall is needed.
+    assert.equal(operations.filter((operation) => operation.type === 'delete').length, 0);
     assert.equal(operations.filter((operation) => operation.type === 'interactive').length, 0);
   });
 
@@ -211,7 +212,7 @@ describe('FeishuStreamCoordinator', () => {
     const interactiveIndex = operations.findIndex((operation) => operation.type === 'interactive');
     assert.ok(interactiveIndex > operations.findIndex((operation) => operation.type === 'create' && operation.content?.startsWith('tools:')));
     assert.equal(operations.filter((operation) => operation.type === 'interactive').length, 1);
-    assert.ok(operations.some((operation) => operation.type === 'delete'));
+    assert.equal(operations.filter((operation) => operation.type === 'delete').length, 0);
   });
 
   it('ignores stale events so a late callback cannot reopen an old group', async () => {
