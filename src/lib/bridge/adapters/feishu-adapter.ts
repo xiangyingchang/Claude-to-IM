@@ -63,15 +63,17 @@ interface FeishuCardState {
   editCount: number;
   /** Length of text already shown in prior segment(s); new segment shows only the delta. */
   baseLength: number;
+  /** Last content string sent, for dedup (skip no-op edits). */
+  lastSentContent: string;
 }
 
 /** Streaming update throttle interval (ms). */
-const CARD_THROTTLE_MS = 200;
+const CARD_THROTTLE_MS = 500;
 
 /** Max progressive edits per message before we start a fresh message.
  *  Feishu's edit-message API allows at most 20 edits per message; we stay
  *  well under with room for the finalize edit. */
-const MAX_EDITS_PER_MESSAGE = 15;
+const MAX_EDITS_PER_MESSAGE = 12;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -420,6 +422,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         throttleTimer: null,
         editCount: 0,
         baseLength: 0,
+        lastSentContent: '',
       });
 
       console.log(`[feishu-adapter] Streaming message created: msgId=${messageId}`);
@@ -497,18 +500,30 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Show only the delta since the last segment (baseLength).
     const shown = (state.pendingText || '').slice(state.baseLength);
     const content = buildStreamingContent(shown, state.toolCalls);
+    const postContent = buildPostContent(content);
+
+    // Dedup: skip if content is identical to the last edit (no-op).
+    if (postContent === state.lastSentContent) return;
 
     state.sequence++;
     const messageId = state.messageId;
 
+    // Count optimistically BEFORE sending: Feishu counts every successful PUT
+    // against the 20-edit cap, so we must reserve budget synchronously —
+    // otherwise concurrent flushes all read the same stale editCount and blow
+    // past the cap (error 230072).
+    state.editCount++;
+    state.lastSentContent = postContent;
+    state.lastUpdateAt = Date.now();
+
     // Fire-and-forget — streaming updates are non-critical
     this.restClient.im.message.update({
       path: { message_id: messageId },
-      data: { msg_type: 'post', content: buildPostContent(content) },
-    }).then(() => {
-      state.lastUpdateAt = Date.now();
-      state.editCount++;
+      data: { msg_type: 'post', content: postContent },
     }).catch((err: unknown) => {
+      // A failed edit still consumed budget server-side only if it reached the
+      // API; be conservative and log, but do not roll back editCount (retrying
+      // same content is usually pointless).
       console.warn('[feishu-adapter] message.update failed:', err instanceof Error ? err.message : err);
     });
   }

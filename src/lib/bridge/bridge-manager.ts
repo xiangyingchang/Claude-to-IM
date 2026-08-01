@@ -701,9 +701,9 @@ async function handleMessage(
     try { adapter.onStreamText!(msg.address.chatId, fullText); } catch { /* non-critical */ }
   } : undefined;
 
-  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error') => {
+  const onToolEvent = hasStreamingCards ? (toolId: string, toolName: string, status: 'running' | 'complete' | 'error', toolInput?: string) => {
     if (toolName) {
-      toolCallTracker.set(toolId, { id: toolId, name: toolName, status });
+      toolCallTracker.set(toolId, { id: toolId, name: toolName, status, input: toolInput || undefined });
     } else {
       // tool_result doesn't carry name — update existing entry's status
       const existing = toolCallTracker.get(toolId);

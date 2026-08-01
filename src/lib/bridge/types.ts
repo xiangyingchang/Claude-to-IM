@@ -174,6 +174,8 @@ export interface ToolCallInfo {
   id: string;
   name: string;
   status: 'running' | 'complete' | 'error';
+  /** Tool input summary (e.g. bash command, file path) for execution records. */
+  input?: string;
 }
 
 // ── Config ─────────────────────────────────────────────────────

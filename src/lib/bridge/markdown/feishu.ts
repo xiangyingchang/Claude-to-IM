@@ -99,7 +99,9 @@ export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
   if (tools.length === 0) return '';
   const lines = tools.map((tc) => {
     const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    return `${icon} \`${tc.name}\``;
+    const name = tc.name || 'tool';
+    const input = tc.input ? ` \`${tc.input}\`` : '';
+    return `${icon} **${name}**${input}`;
   });
   return lines.join('\n');
 }
