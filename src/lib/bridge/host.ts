@@ -260,4 +260,11 @@ export interface LifecycleHooks {
    * Returns an ordered list of model identifiers.
    */
   onGetModels?(): Promise<string[]>;
+  /**
+   * Called when the host should restart the bridge process so a config
+   * change (e.g. runtime switch) takes effect. The host is responsible for
+   * restarting the daemon (launchd Kickstart on macOS, process exit as
+   * fallback) so the supervisor respawns it with the new configuration.
+   */
+  onRestartBridge?(): Promise<void>;
 }

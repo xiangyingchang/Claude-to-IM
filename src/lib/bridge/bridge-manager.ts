@@ -19,6 +19,7 @@ import { deliver, deliverRendered } from './delivery-layer.js';
 import { markdownToTelegramChunks } from './markdown/telegram.js';
 import { markdownToDiscordChunks } from './markdown/discord.js';
 import { getBridgeContext } from './context.js';
+import type { LifecycleHooks } from './host.js';
 import { escapeHtml } from './adapters/telegram-utils.js';
 import {
   validateWorkingDirectory,
@@ -178,6 +179,9 @@ interface BridgeManagerState {
   /** Per-session processing chains for concurrency control */
   sessionLocks: Map<string, Promise<void>>;
   autoStartChecked: boolean;
+  /** Pending bridge-restart timer (after a runtime switch). Cleared on stop
+   *  so a manual `/claude-to-im stop` cancels an in-flight auto-restart. */
+  restartTimer: NodeJS.Timeout | null;
 }
 
 function getState(): BridgeManagerState {
@@ -192,6 +196,7 @@ function getState(): BridgeManagerState {
       activeTasks: new Map(),
       sessionLocks: new Map(),
       autoStartChecked: false,
+      restartTimer: null,
     };
   }
   // Backfill sessionLocks for states created before this field existed
@@ -199,6 +204,21 @@ function getState(): BridgeManagerState {
     g[GLOBAL_KEY].sessionLocks = new Map();
   }
   return g[GLOBAL_KEY];
+}
+
+/**
+ * Schedule a bridge auto-restart (after a runtime switch). Tracked on state so
+ * `stop()` can cancel it — a manual stop must not be undone by a pending
+ * restart. Duplicate schedules replace the previous timer.
+ */
+function scheduleRestart(lifecycle: LifecycleHooks): void {
+  const state = getState();
+  if (state.restartTimer) clearTimeout(state.restartTimer);
+  state.restartTimer = setTimeout(() => {
+    state.restartTimer = null;
+    // The bridge may have stopped while the timer was pending.
+    if (state.running) lifecycle.onRestartBridge?.();
+  }, 2000);
 }
 
 /**
@@ -300,6 +320,13 @@ export async function stop(): Promise<void> {
   const { lifecycle } = getBridgeContext();
 
   state.running = false;
+
+  // Cancel any pending auto-restart so a manual stop isn't undone by a
+  // runtime-switch restart scheduled earlier.
+  if (state.restartTimer) {
+    clearTimeout(state.restartTimer);
+    state.restartTimer = null;
+  }
 
   // Abort all event loops
   for (const [, abort] of state.loopAborts) {
@@ -484,6 +511,60 @@ async function handleMessage(
         replyToMessageId: msg.callbackMessageId,
       });
       ack();
+      return;
+    }
+
+    // ── Runtime selection callback (from the /runtime selector) ──
+    if (msg.callbackData.startsWith('runtime:')) {
+      const newRuntime = msg.callbackData.slice('runtime:'.length);
+      const { lifecycle } = getBridgeContext();
+      const current = store.getSetting('bridge_runtime') || 'claude';
+
+      if (newRuntime === current) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: `Already on <b>${escapeHtml(current)}</b>.`,
+          parseMode: 'HTML',
+          replyToMessageId: msg.callbackMessageId,
+        });
+        ack();
+        return;
+      }
+
+      const applied = lifecycle.onRuntimeChange
+        ? await lifecycle.onRuntimeChange(newRuntime)
+        : null;
+      if (!applied) {
+        await deliver(adapter, {
+          address: msg.address,
+          text: 'Failed to switch runtime. Check the bridge logs for details.',
+          parseMode: 'HTML',
+          replyToMessageId: msg.callbackMessageId,
+        });
+        ack();
+        return;
+      }
+
+      store.insertAuditLog({
+        channelType: adapter.channelType,
+        chatId: msg.address.chatId,
+        direction: 'inbound',
+        messageId: msg.messageId,
+        summary: `[CONFIG] Runtime changed to: ${applied}`,
+      });
+      await deliver(adapter, {
+        address: msg.address,
+        text: `Switching runtime to <b>${escapeHtml(applied)}</b>. Restarting...`,
+        parseMode: 'HTML',
+        replyToMessageId: msg.callbackMessageId,
+      });
+      ack();
+
+      // Give the reply a moment to flush before restarting the daemon.
+      // Tracked so a manual stop cancels the pending restart.
+      if (lifecycle.onRestartBridge) {
+        scheduleRestart(lifecycle);
+      }
       return;
     }
 
@@ -862,7 +943,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
-        '/runtime claude|codex|auto - Switch LLM runtime (needs restart)',
+        '/runtime - Switch LLM runtime (auto-restart, or /runtime &lt;name&gt;)',
         '/models - List available models',
         '/status - Show current status',
         '/sessions - List recent sessions',
@@ -1006,14 +1087,33 @@ async function handleCommand(
     }
 
     case '/runtime': {
-      const validRuntimes = ['claude', 'codex', 'auto'];
-      const newRuntime = args.trim().toLowerCase();
-      if (!validRuntimes.includes(newRuntime)) {
-        const current = store.getSetting('bridge_runtime') || 'claude';
-        response = `Usage: /runtime claude|codex|auto\nCurrent runtime: <b>${current}</b>`;
+      const { lifecycle } = getBridgeContext();
+      const current = store.getSetting('bridge_runtime') || 'claude';
+
+      // No args → render an inline selector (like /models), auto-restart on click.
+      if (!args.trim()) {
+        const options = ['claude', 'codex', 'pi'];
+        const rows = options.map(rt => ([{
+          text: rt === current ? `✅ ${rt}` : rt,
+          callbackData: `runtime:${rt}`,
+        }]));
+        await deliver(adapter, {
+          address: msg.address,
+          text: `Current runtime: <b>${escapeHtml(current)}</b>\nSelect a runtime (bridge will auto-restart):`,
+          parseMode: 'HTML',
+          inlineButtons: rows,
+          replyToMessageId: msg.messageId,
+        });
         break;
       }
-      const { lifecycle } = getBridgeContext();
+
+      // With args → text-based switch (existing behavior) + auto-restart.
+      const validRuntimes = ['claude', 'codex', 'pi', 'auto'];
+      const newRuntime = args.trim().toLowerCase();
+      if (!validRuntimes.includes(newRuntime)) {
+        response = `Usage: /runtime claude|codex|pi|auto\nCurrent runtime: <b>${current}</b>`;
+        break;
+      }
       if (!lifecycle.onRuntimeChange) {
         response = 'Runtime switching is not supported in this environment.';
         break;
@@ -1027,12 +1127,10 @@ async function handleCommand(
           messageId: msg.messageId,
           summary: `[CONFIG] Runtime changed to: ${applied}`,
         });
-        response = [
-          `Runtime changed to <b>${applied}</b>.`,
-          '',
-          '⚠️ <b>Restart required.</b> The bridge must be restarted for this to take effect.',
-          'Restart it from your terminal: <code>/claude-to-im stop &amp;&amp; /claude-to-im start</code>',
-        ].join('\n');
+        response = `Runtime changed to <b>${applied}</b>. Restarting...`;
+        if (lifecycle.onRestartBridge) {
+          scheduleRestart(lifecycle);
+        }
       } else {
         response = 'Failed to update runtime. Check the bridge logs for details.';
       }
@@ -1086,7 +1184,7 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
-        '/runtime claude|codex|auto - Switch LLM runtime (needs restart)',
+        '/runtime - Switch LLM runtime (auto-restart, or /runtime &lt;name&gt;)',
         '/models - List available models',
         '/status - Show current status',
         '/sessions - List recent sessions',
