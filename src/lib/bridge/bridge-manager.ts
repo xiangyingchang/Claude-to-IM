@@ -692,8 +692,10 @@ async function handleMessage(
   try {
     // Pass permission callback so requests are forwarded to IM immediately
     // during streaming (the stream blocks until permission is resolved).
-    // Use text or empty string for image-only messages (prompt is still required by streamClaude)
-    const promptText = text || (hasAttachments ? 'Describe this image.' : '');
+    // Use a neutral prompt for attachment-only messages. The old
+    // "Describe this image." was wrong for zip/txt/video attachments and made
+    // the model claim "there is no image" even though files arrived.
+    const promptText = text || (hasAttachments ? '请查看并处理上面用户上传的附件，按附件的实际内容回答。' : '');
 
     const result = await engine.processMessage(binding, promptText, async (perm) => {
       await broker.forwardPermissionRequest(

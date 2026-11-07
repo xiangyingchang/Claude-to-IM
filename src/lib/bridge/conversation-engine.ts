@@ -16,6 +16,7 @@ import type {
   MessageContentBlock,
 } from './host.js';
 import { getBridgeContext } from './context.js';
+import { intakeAttachments } from './attachment-intake.js';
 import crypto from 'crypto';
 
 export interface PermissionRequestInfo {
@@ -100,6 +101,8 @@ export async function processMessage(
     // Save user message — persist file attachments to disk using the same
     // <!--files:JSON--> format as the desktop chat route, so the UI can render them.
     let savedContent = text;
+    let effectiveText = text;
+    let effectiveFiles = files;
     if (files && files.length > 0) {
       const workDir = binding.workingDirectory || session?.working_directory || '';
       if (workDir) {
@@ -113,6 +116,7 @@ export async function processMessage(
             const filePath = path.join(uploadDir, `${Date.now()}-${safeName}`);
             const buffer = Buffer.from(f.data, 'base64');
             fs.writeFileSync(filePath, buffer);
+            (f as any).filePath = filePath; // back-fill on-disk path for zip introspection
             return { id: f.id, name: f.name, type: f.type, size: buffer.length, filePath };
           });
           savedContent = `<!--files:${JSON.stringify(fileMeta)}-->${text}`;
@@ -121,7 +125,17 @@ export async function processMessage(
           savedContent = `[${files.length} image(s) attached] ${text}`;
         }
       } else {
-        savedContent = `[${files.length} image(s) attached] ${text}`;
+        savedContent = `[${files.length} attachment(s)] ${text}`;
+      }
+      // Turn any attachment into something the model can actually see.
+      // workDir is in scope here (declared above).
+      try {
+        const intake = intakeAttachments(files, workDir);
+        effectiveFiles = intake.files;
+        effectiveText = intake.summary + text;
+      } catch (err) {
+        console.warn('[conversation-engine] Attachment intake failed:', err instanceof Error ? err.message : err);
+        effectiveText = `[用户上传了 ${files.length} 个附件，但自动解析失败，请让用户直接粘贴文字或单独发图片]\n\n${text}`;
       }
     }
     store.addMessage(sessionId, 'user', savedContent);
@@ -165,7 +179,7 @@ export async function processMessage(
     }
 
     const stream = llm.streamChat({
-      prompt: text,
+      prompt: effectiveText,
       sessionId,
       sdkSessionId: binding.sdkSessionId || undefined,
       model: effectiveModel,
@@ -175,7 +189,7 @@ export async function processMessage(
       permissionMode,
       provider: resolvedProvider,
       conversationHistory: historyMsgs,
-      files,
+      files: effectiveFiles,
       onRuntimeStatusChange: (status: string) => {
         try { store.setSessionRuntimeStatus(sessionId, status); } catch { /* best effort */ }
       },
@@ -383,12 +397,20 @@ async function consumeStream(
       }
     }
 
-    // Extract text-only response for IM delivery
-    const responseText = contentBlocks
-      .filter((b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text')
-      .map((b) => b.text)
-      .join('')
-      .trim();
+    // Extract text-only response for IM delivery.
+    //
+    // Claude Code emits short narration lines ("Now edit the push script...",
+    // "Next, the conversation side...") between tool_use events. Those are
+    // working notes for an interactive terminal, not part of the answer for
+    // the IM user. contentBlocks stores every text segment (split at each
+    // tool_use), so joining all of them used to prepend that narration to the
+    // real reply. Only the LAST text block is the final answer delivered after
+    // all tools have finished. Take just that one; fall back to empty string
+    // when the turn produced no text at all (pure tool-use turns).
+    const textBlocks = contentBlocks.filter(
+      (b): b is Extract<MessageContentBlock, { type: 'text' }> => b.type === 'text'
+    );
+    const responseText = (textBlocks.length > 0 ? textBlocks[textBlocks.length - 1].text : '').trim();
 
     return {
       responseText,
